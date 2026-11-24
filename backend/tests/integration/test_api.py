@@ -1,0 +1,1053 @@
+"""
+=============================================================
+FILE PENGUJIAN WHITE BOX - SISTEM MIKROSKOP DIGITAL
+Menggunakan: Pytest + FastAPI TestClient
+=============================================================
+Cara menjalankan:
+    .\\venv\\Scripts\\python.exe -m pytest test_api.py -v
+Dengan coverage:
+    .\\venv\\Scripts\\python.exe -m pytest test_api.py --cov=app --cov-report=term-missing --cov-branch -v
+"""
+import asyncio
+import io
+import os
+import random
+import time
+import uuid
+
+import cv2
+import numpy as np
+import pytest
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+
+from app.main import app
+from app.services.auth_service import hash_password, verify_password, create_access_token
+from helpers import auth, token_for
+
+client = TestClient(app)
+# Kategori B-L menguji perilaku fungsional, jadi memakai sesi admin.
+# Autentikasi dan otorisasi sendiri diuji di tests/security/test_security.py.
+client.headers.update(auth(token_for("uji_admin", "ADMIN")))
+
+EDGE_WS = "/api/hardware/ws?device_token=token-edge-pengujian"
+
+# Penyimpanan state ringan antar-test dalam satu kategori (folder id, dsb.)
+# — bukan fixture pytest, sengaja dibuat sederhana mengikuti gaya file ini.
+_shared = {}
+
+
+def _make_test_image_bytes(color=(100, 150, 200)):
+    """Membuat citra JPEG kecil secara in-memory (tanpa file fisik) untuk uji unggah/analisis."""
+    img = np.zeros((60, 60, 3), dtype=np.uint8)
+    img[:] = color
+    ok, buf = cv2.imencode(".jpg", img)
+    assert ok
+    return io.BytesIO(buf.tobytes())
+
+
+def _ensure_hardware_bus_enabled():
+    client.post("/api/hardware/bus/toggle", json={"enabled": True})
+
+
+# ============================================================
+# KATEGORI A: UNIT TEST - LAYANAN AUTENTIKASI (auth_service.py)
+# ============================================================
+
+def test_unit_A1_hash_password_berubah():
+    """
+    A1: Password asli harus diubah menjadi string acak (hash) oleh bcrypt.
+    Branch Coverage: jalur hashing normal.
+    """
+    password = "password_lab_2025"
+    hashed = hash_password(password)
+    assert hashed != password  # Harus berbeda dari aslinya
+
+def test_unit_A2_verify_password_cocok():
+    """
+    A2: Fungsi verify harus mengembalikan True jika password cocok dengan hash-nya.
+    Branch Coverage: cabang True pada bcrypt.checkpw.
+    """
+    password = "password_lab_2025"
+    hashed = hash_password(password)
+    assert verify_password(password, hashed) == True
+
+def test_unit_A3_verify_password_salah():
+    """
+    A3: Fungsi verify harus mengembalikan False jika password TIDAK cocok.
+    Branch Coverage: cabang False pada bcrypt.checkpw.
+    """
+    password_asli = "password_benar"
+    hashed = hash_password(password_asli)
+    assert verify_password("password_salah", hashed) == False
+
+def test_unit_A4_token_jwt_terbentuk():
+    """
+    A4: Fungsi create_access_token harus menghasilkan string JWT yang tidak kosong.
+    Statement Coverage: seluruh baris fungsi create_access_token tereksekusi.
+    """
+    token = create_access_token(data={"sub": "operator_uji", "role": "OPERATOR"})
+    assert token is not None
+    assert len(token) > 20  # Token JWT pasti panjang
+
+
+# ============================================================
+# KATEGORI B: FEATURE TEST - ENDPOINT AUTENTIKASI
+# ============================================================
+
+def test_feature_B1_health_check():
+    """
+    B1: Root endpoint "/" harus merespons 200 OK dan status ONLINE.
+    Statement Coverage: memastikan server hidup dan konfigurasi router terdaftar.
+    """
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ONLINE"
+
+def test_feature_B2_login_kredensial_salah():
+    """
+    B2: Login dengan password salah harus ditolak (HTTP 401).
+    Branch Coverage: cabang "not user or not verify_password" di auth.py terpenuhi.
+    """
+    response = client.post("/api/auth/login", json={
+        "username": "user_tidak_ada_di_db",
+        "password": "password_ngasal_123"
+    })
+    assert response.status_code == 401
+
+def test_feature_B3_registrasi_user_baru():
+    """
+    B3: Registrasi username baru harus berhasil (HTTP 201).
+    Statement Coverage: alur pembuatan user baru di database tereksekusi.
+    """
+    username_unik = f"operator_tes_{random.randint(1000, 9999)}"
+    response = client.post("/api/auth/register", json={
+        "username": username_unik,
+        "password": "test_password"
+    })
+    assert response.status_code == 201
+    assert "username" in response.json()
+
+def test_feature_B4_registrasi_username_duplikat():
+    """
+    B4: Mendaftarkan username yang sudah ada harus gagal (HTTP 400).
+    Branch Coverage: cabang "if existing_user" di auth.py terpenuhi.
+    """
+    # Daftarkan pertama kali
+    client.post("/api/auth/register", json={
+        "username": "operator_duplikat_fix",
+        "password": "test123"
+    })
+    # Coba daftarkan lagi dengan username yang sama
+    response = client.post("/api/auth/register", json={
+        "username": "operator_duplikat_fix",
+        "password": "test123"
+    })
+    assert response.status_code == 400
+
+
+# ============================================================
+# KATEGORI C: FEATURE TEST - ENDPOINT HARDWARE (INTI)
+# ============================================================
+
+def test_feature_C1_telemetry_stats_tersedia():
+    """
+    C1: Endpoint telemetri harus bisa diakses dan mengembalikan data statistik server.
+    Statement Coverage: seluruh baris fungsi get_telemetry_stats() tereksekusi.
+    """
+    response = client.get("/api/hardware/telemetry/stats")
+    assert response.status_code == 200
+    data = response.json()
+    assert "serverCpu" in data
+    assert "serverRam" in data
+    assert "hardwareBus" in data
+
+def test_feature_C2_hardware_bus_dinonaktifkan():
+    """
+    C2: Menonaktifkan hardware bus harus berhasil dan memblokir perintah motor.
+    Branch Coverage: cabang "if not hardware_bus_enabled" pada motor/move terpenuhi.
+    """
+    # Matikan hardware bus
+    client.post("/api/hardware/bus/toggle", json={"enabled": False})
+
+    # Coba kirim perintah motor saat bus mati
+    response = client.post("/api/hardware/motor/move", json={
+        "axis": "X", "value": 10.0, "feed_rate": 200.0, "unit": "mm"
+    })
+    assert response.status_code == 503  # Service Unavailable
+
+    # Hidupkan kembali hardware bus setelah pengujian
+    client.post("/api/hardware/bus/toggle", json={"enabled": True})
+
+def test_feature_C3_scan_status_awal():
+    """
+    C3: Status grid scan di awal harus dalam kondisi tidak berjalan (running = False).
+    Statement Coverage: memastikan state awal sistem scan tereksekusi dengan benar.
+    """
+    response = client.get("/api/hardware/scan/status")
+    assert response.status_code == 200
+    assert response.json()["running"] == False
+
+
+# ============================================================
+# KATEGORI D: FEATURE TEST - MANAJEMEN DATASET (dataset.py)
+# ============================================================
+
+def test_feature_D01_create_folder_berhasil():
+    """D01: Membuat folder dataset baru harus berhasil (201) dan tersimpan di DB."""
+    nama_unik = f"folder_uji_{uuid.uuid4().hex[:8]}"
+    response = client.post("/api/dataset/folders", json={
+        "name": nama_unik, "object_type": "Bakteri Uji", "date": "2026-09-02", "operator": "pytest"
+    })
+    assert response.status_code == 201
+    data = response.json()
+    assert data["name"] == nama_unik
+    _shared["folder_id"] = data["id"]
+    _shared["folder_name"] = nama_unik
+
+def test_feature_D02_create_folder_nama_duplikat():
+    """D02: Membuat folder dengan nama yang sudah dipakai harus gagal (400)."""
+    response = client.post("/api/dataset/folders", json={
+        "name": _shared["folder_name"], "object_type": "Bakteri Uji", "date": "2026-09-02", "operator": "pytest"
+    })
+    assert response.status_code == 400
+
+def test_feature_D03_get_all_folders():
+    """D03: Daftar folder harus dapat diambil dan memuat folder yang baru dibuat."""
+    response = client.get("/api/dataset/folders")
+    assert response.status_code == 200
+    ids = [f["id"] for f in response.json()]
+    assert _shared["folder_id"] in ids
+
+def test_feature_D04_update_folder_metadata():
+    """D04: Metadata folder (nama/tipe objek/operator) harus dapat diperbarui."""
+    response = client.put(f"/api/dataset/folders/{_shared['folder_id']}", json={
+        "name": _shared["folder_name"], "object_type": "Bakteri Uji (Revisi)", "operator": "pytest_revisi"
+    })
+    assert response.status_code == 200
+    assert response.json()["object_type"] == "Bakteri Uji (Revisi)"
+
+def test_feature_D05_update_folder_tidak_ditemukan():
+    """D05: Memperbarui folder dengan id yang tidak ada harus mengembalikan 404."""
+    response = client.put("/api/dataset/folders/id_tidak_ada", json={
+        "name": "x", "object_type": "x", "operator": "x"
+    })
+    assert response.status_code == 404
+
+def test_feature_D06_upload_files_ke_folder():
+    """D06: Mengunggah citra ke folder harus menambah image_count folder tersebut."""
+    files = {"files": ("sample.jpg", _make_test_image_bytes(), "image/jpeg")}
+    response = client.post(f"/api/dataset/folders/{_shared['folder_id']}/files", files=files)
+    assert response.status_code == 200
+    assert response.json()["current_image_count"] >= 1
+
+def test_feature_D07_get_folder_images():
+    """D07: Daftar citra dalam folder harus memuat citra yang baru diunggah."""
+    response = client.get(f"/api/dataset/folders/{_shared['folder_id']}/images")
+    assert response.status_code == 200
+    names = [img["name"] for img in response.json()]
+    assert "sample.jpg" in names
+
+def test_feature_D08_download_single_file():
+    """D08: Mengunduh satu citra tertentu dari folder harus berhasil (200)."""
+    response = client.get(f"/api/dataset/folders/{_shared['folder_id']}/files/sample.jpg/download")
+    assert response.status_code == 200
+
+def test_feature_D09_get_storage_info():
+    """D09: Info kapasitas penyimpanan harus tersedia dengan field yang benar."""
+    response = client.get("/api/dataset/storage-info")
+    assert response.status_code == 200
+    data = response.json()
+    assert "total_gb" in data and "used_gb" in data
+
+def test_feature_D10_get_vps_sync_index():
+    """D10: Index sinkronisasi VPS<->Edge harus memuat folder yang ada."""
+    response = client.get("/api/dataset/vps/sync-index")
+    assert response.status_code == 200
+    assert _shared["folder_id"] in response.json()["folders"]
+
+def test_feature_D11_download_folder_zip():
+    """D11: Folder berisi citra harus dapat diunduh sebagai satu arsip ZIP."""
+    response = client.get(f"/api/dataset/folders/{_shared['folder_id']}/download")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+
+def test_feature_D12_delete_images_in_folder():
+    """D12: Menghapus citra tertentu dari folder harus mengurangi image_count."""
+    response = client.request(
+        "DELETE", f"/api/dataset/folders/{_shared['folder_id']}/images",
+        json={"filenames": ["sample.jpg"]}
+    )
+    assert response.status_code == 200
+    assert response.json()["current_image_count"] == 0
+
+def test_feature_D13_delete_folder():
+    """D13: Menghapus folder dataset (beserta metadata & file fisiknya) harus berhasil."""
+    response = client.delete(f"/api/dataset/folders/{_shared['folder_id']}")
+    assert response.status_code == 200
+
+def test_feature_D14_delete_folder_tidak_ditemukan():
+    """D14: Menghapus folder yang tidak ada harus mengembalikan 404."""
+    response = client.delete(f"/api/dataset/folders/{_shared['folder_id']}")
+    assert response.status_code == 404
+
+
+# ============================================================
+# KATEGORI E: FEATURE TEST - ANALISIS CITRA (analysis.py)
+# Edge Device offline pada lingkungan pengujian -> menempuh jalur
+# FALLBACK process_locally() (OpenCV murni), sehingga tetap dapat
+# diuji end-to-end tanpa perangkat keras fisik.
+# ============================================================
+
+def test_feature_E01_upload_image_for_analysis():
+    """E01: Mengunggah citra untuk dianalisis harus berhasil dan mengembalikan nama file server."""
+    files = {"file": ("analisis.jpg", _make_test_image_bytes(), "image/jpeg")}
+    response = client.post("/api/analysis/upload", files=files)
+    assert response.status_code == 200
+    _shared["analysis_filename"] = response.json()["filename"]
+
+def test_feature_E02_apply_tool_nama_tidak_dikenal():
+    """E02: Memanggil tool analisis dengan nama tak dikenal harus gagal (400)."""
+    response = client.post("/api/analysis/nama-tool-ngasal", json={
+        "filename": _shared["analysis_filename"], "current_src": "", "params": {}
+    })
+    assert response.status_code == 400
+
+def test_feature_E03_apply_tool_adaptive_threshold_fallback_lokal():
+    """E03: Tool adaptive-thresh harus berhasil diproses via fallback lokal (Edge offline)."""
+    response = client.post("/api/analysis/adaptive-thresh", json={
+        "filename": _shared["analysis_filename"], "current_src": "", "params": {"blockSize": 11, "C": 2}
+    })
+    assert response.status_code == 200
+    assert response.json()["processed_by"] == "server (edge offline)"
+
+def test_feature_E04_apply_tool_colony_count_fallback_lokal():
+    """E04: Tool colony-count harus berhasil diproses via fallback lokal dan mengembalikan jumlah koloni."""
+    response = client.post("/api/analysis/colony-count", json={
+        "filename": _shared["analysis_filename"], "current_src": "", "params": {}
+    })
+    assert response.status_code == 200
+    # CV berjalan asinkron: POST hanya memulai, hasilnya dibaca lewat polling /status.
+    output = response.json()["output"]
+    for _ in range(50):
+        status = client.get("/api/analysis/status", params={"output": output}).json()
+        if status.get("done") or status.get("error"):
+            break
+        time.sleep(0.2)
+    assert status.get("done") is True
+    assert "colonies" in status
+
+def test_feature_E05_apply_tool_file_tidak_ditemukan():
+    """E05: Menerapkan tool pada file yang tidak ada di server harus mengembalikan 404."""
+    response = client.post("/api/analysis/adaptive-thresh", json={
+        "filename": "file_yang_tidak_pernah_ada.jpg", "current_src": "", "params": {}
+    })
+    assert response.status_code == 404
+
+
+# ============================================================
+# KATEGORI F: FEATURE TEST - PEMBUATAN LAPORAN (documentation.py)
+# Menggunakan folder dataset baru (independen dari Kategori D yang
+# sudah menghapus foldernya) supaya galeri laporan tidak kosong.
+# ============================================================
+
+def test_feature_F00_setup_folder_untuk_laporan():
+    """F00 (setup): Buat folder + unggah 1 citra khusus untuk pengujian laporan."""
+    nama_unik = f"folder_laporan_{uuid.uuid4().hex[:8]}"
+    resp = client.post("/api/dataset/folders", json={
+        "name": nama_unik, "object_type": "Bakteri Uji", "date": "2026-09-02", "operator": "pytest"
+    })
+    assert resp.status_code == 201
+    _shared["report_folder_id"] = resp.json()["id"]
+    files = {"files": ("laporan.jpg", _make_test_image_bytes(), "image/jpeg")}
+    client.post(f"/api/dataset/folders/{_shared['report_folder_id']}/files", files=files)
+
+def test_feature_F01_generate_report_word():
+    """F01: Membuat laporan format Word harus menghasilkan file .docx (200)."""
+    response = client.post(
+        "/api/documentation/generate?format=WORD",
+        json={"folder_id": _shared["report_folder_id"], "author": "Pytest"}
+    )
+    assert response.status_code == 200
+
+def test_feature_F02_generate_report_excel():
+    """F02: Membuat laporan format Excel harus menghasilkan file .xlsx (200)."""
+    response = client.post(
+        "/api/documentation/generate?format=EXCEL",
+        json={"folder_id": _shared["report_folder_id"], "author": "Pytest"}
+    )
+    assert response.status_code == 200
+
+def test_feature_F03_generate_report_ppt():
+    """F03: Membuat laporan format PowerPoint harus menghasilkan file .pptx (200)."""
+    response = client.post(
+        "/api/documentation/generate?format=PPT",
+        json={"folder_id": _shared["report_folder_id"], "author": "Pytest"}
+    )
+    assert response.status_code == 200
+
+def test_feature_F04_generate_report_format_tidak_dikenal():
+    """F04: Format laporan yang tidak dikenali harus ditolak (400)."""
+    response = client.post(
+        "/api/documentation/generate?format=XML",
+        json={"folder_id": _shared["report_folder_id"], "author": "Pytest"}
+    )
+    assert response.status_code == 400
+
+def test_feature_F99_cleanup_folder_laporan():
+    """F99 (cleanup): Hapus folder yang dipakai khusus untuk pengujian laporan."""
+    response = client.delete(f"/api/dataset/folders/{_shared['report_folder_id']}")
+    assert response.status_code == 200
+
+
+# ============================================================
+# KATEGORI G: FEATURE TEST - HARDWARE LANJUTAN (hardware.py)
+# Edge Device offline -> instruksi kendali diteruskan tapi mengembalikan
+# status "Edge Device Offline" pada grbl_response; ini memvalidasi jalur
+# API/guard, bukan gerakan motor fisik (itu ranah pengujian hardware).
+# ============================================================
+
+def test_feature_G01_get_system_config():
+    """G01: Endpoint konfigurasi sistem tersimpan harus dapat diakses."""
+    response = client.get("/api/hardware/config")
+    assert response.status_code == 200
+
+def test_feature_G02_set_ai_config():
+    """G02: Mengatur ambang keyakinan AI (confThreshold) harus tersimpan."""
+    response = client.put("/api/hardware/config/ai", json={"confThreshold": 40})
+    assert response.status_code == 200
+    assert response.json()["confThreshold"] == 40
+
+def test_feature_G03_reset_config_default():
+    """G03: Mereset konfigurasi section 'cnc' ke default harus berhasil."""
+    response = client.post("/api/hardware/config/cnc/default")
+    assert response.status_code == 200
+
+def test_feature_G04_apply_camera_settings():
+    """G04: Menerapkan pengaturan kamera (shutter/ISO) saat hardware bus aktif harus berhasil."""
+    _ensure_hardware_bus_enabled()
+    response = client.post("/api/hardware/camera/settings", json={"shutter_speed": 5000, "iso": 400})
+    assert response.status_code == 200
+
+def test_feature_G05_apply_cnc_settings():
+    """G05: Menerapkan pengaturan CNC (feed rate/backlash/dll) saat hardware bus aktif harus berhasil."""
+    response = client.post("/api/hardware/cnc/settings", json={
+        "feed_rate": 250.0, "backlash": 0.1, "acceleration": 500.0, "settle_time": 300
+    })
+    assert response.status_code == 200
+
+def test_feature_G06_apply_soft_limits():
+    """G06: Menerapkan batas gerak (soft limit) motor harus tersimpan dan diteruskan ke Edge."""
+    response = client.post("/api/hardware/cnc/soft-limits", json={
+        "enabled": True, "x_min": 0, "x_max": 100, "y_min": 0, "y_max": 100
+    })
+    assert response.status_code == 200
+
+def test_feature_G07_motor_home():
+    """G07: Perintah homing motor harus diterima API (respons 200) walau Edge offline."""
+    response = client.post("/api/hardware/motor/home")
+    assert response.status_code == 200
+
+def test_feature_G08_motor_unlock():
+    """G08: Perintah unlock GRBL harus diterima API (respons 200) walau Edge offline."""
+    response = client.post("/api/hardware/motor/unlock")
+    assert response.status_code == 200
+
+def test_feature_G09_motor_set_position():
+    """G09: Menulis ulang koordinat kerja (tanpa menggerakkan motor) harus berhasil."""
+    response = client.post("/api/hardware/motor/set-position", json={"x": 0, "y": 0, "z": 0})
+    assert response.status_code == 200
+
+def test_feature_G10_edge_restart_jetson_offline():
+    """G10: Merestart layanan Edge saat Jetson offline harus ditolak (409), bukan error senyap."""
+    response = client.post("/api/hardware/edge/restart")
+    assert response.status_code == 409
+
+def test_feature_G11_scan_grid_start_dan_cancel():
+    """G11: Memulai grid scan harus langsung merespons STARTED, lalu dapat dibatalkan."""
+    start = client.post("/api/hardware/scan/grid", json={
+        "columns": 2, "rows": 2, "step_x": 1.0, "step_y": 1.0,
+        "delay_ms": 100, "unit": "mm", "start_x": 0.0, "start_y": 0.0
+    })
+    assert start.status_code == 200
+    assert start.json()["status"] == "STARTED"
+    cancel = client.post("/api/hardware/scan/cancel")
+    assert cancel.status_code == 200
+
+def test_feature_G11b_scan_hanya_pemilik_yang_bisa_batal():
+    """G11b: Scan mencatat pemiliknya. Operator lain (bukan Pilot) hanya menonton dan ditolak
+    saat mencoba membatalkan; pemilik tetap bisa membatalkan."""
+    from app.routers import hardware
+    # TestClient tidak menjalankan task scan di latar belakang, jadi scan tes sebelumnya
+    # tetap tercatat "running". Kosongkan dulu supaya scan baru bisa dimulai.
+    hardware._scan_state.update({"running": False, "cancel": False})
+    start = client.post("/api/hardware/scan/grid", json={
+        "columns": 3, "rows": 3, "step_x": 1.0, "step_y": 1.0,
+        "delay_ms": 100, "unit": "mm", "start_x": 0.0, "start_y": 0.0
+    })
+    assert start.status_code == 200, start.text
+    status = client.get("/api/hardware/scan/status").json()
+    assert status["owner"] == "uji_admin"
+    lain = TestClient(app)
+    lain.headers.update(auth(token_for(f"penonton_{uuid.uuid4().hex[:6]}", "OPERATOR")))
+    assert lain.get("/api/hardware/scan/status").json()["owner"] == "uji_admin"
+    assert lain.post("/api/hardware/scan/cancel").status_code == 403
+    assert client.post("/api/hardware/scan/cancel").json()["status"] == "CANCELLING"
+    hardware._scan_state.update({"running": False, "cancel": False})
+
+
+def test_feature_G12b_stitch_mencatat_pemilik():
+    """G12b: Status stitching menyebut siapa yang memulainya, untuk tampilan penonton."""
+    client.post("/api/hardware/stitch", json={"images": [], "tiles": [], "session": "pytest-owner"})
+    assert client.get("/api/hardware/stitch/status").json()["owner"] == "uji_admin"
+
+
+def test_feature_G14_cnc_parsial_tidak_menimpa_nilai_lain():
+    """G14: Mengubah feed rate saja (slider Admin Control) tidak menimpa backlash, akselerasi,
+    dan waktu tunggu yang diatur di Live Stream."""
+    full = {"feed_rate": 300, "backlash": 0.2, "acceleration": 15, "settle_time": 120}
+    assert client.post("/api/hardware/cnc/settings", json=full).status_code == 200
+    r = client.post("/api/hardware/cnc/settings", json={"feed_rate": 400})
+    assert r.status_code == 200
+    assert r.json()["applied"] == {"feed_rate": 400, "backlash": 0.2, "acceleration": 15, "settle_time": 120}
+    cfg = client.get("/api/hardware/config").json()
+    assert float(cfg["backlash"]) == 0.2 and float(cfg["feedRate"]) == 400
+
+
+def test_feature_G15_reset_cnc_kembali_ke_bawaan():
+    """G15: Reset CNC menghapus nilai tersimpan, sehingga pengaturan berikutnya memakai bawaan."""
+    client.post("/api/hardware/cnc/settings", json={"feed_rate": 500, "backlash": 0.3})
+    assert client.post("/api/hardware/config/cnc/default").status_code == 200
+    r = client.post("/api/hardware/cnc/settings", json={})
+    assert r.json()["applied"] == {"feed_rate": 250.0, "backlash": 0.05, "acceleration": 10.0, "settle_time": 500}
+
+
+def test_feature_G12_stitch_start_dan_status():
+    """G12: Memulai proses stitching harus merespons STARTED dan status dapat dipantau."""
+    start = client.post("/api/hardware/stitch", json={"images": [], "tiles": [], "session": "pytest-session"})
+    assert start.status_code == 200
+    status = client.get("/api/hardware/stitch/status")
+    assert status.status_code == 200
+
+def test_feature_G13_room_admin_action_sesi_tidak_ada():
+    """G13: Aksi admin (mis. KICK) pada connection id yang tidak ada harus mengembalikan 404."""
+    response = client.post("/api/hardware/room/admin_action", json={
+        "cid": "cid-tidak-pernah-ada", "action": "KICK"
+    })
+    assert response.status_code == 404
+
+
+# ============================================================
+# KATEGORI H: FEATURE TEST - SIKLUS RBAC OPERATOR (auth.py lanjutan)
+# Satu skenario berurutan: registrasi -> ganti password sendiri ->
+# ubah peran oleh Admin -> reset password oleh Admin -> hapus akun.
+# ============================================================
+
+def test_feature_H01_lifecycle_rbac_operator():
+    """H01: Siklus penuh manajemen operator: registrasi, ganti password mandiri,
+    ubah peran, reset password oleh Admin, dan penghapusan akun."""
+    username = f"operator_rbac_{uuid.uuid4().hex[:8]}"
+    original_password = "PasswordAwal123"
+
+    # Registrasi
+    reg = client.post("/api/auth/register", json={"username": username, "password": original_password})
+    assert reg.status_code == 201
+
+    # Cari id operator yang baru dibuat
+    operators = client.get("/api/auth/operators").json()
+    match = [o for o in operators if o["username"] == username]
+    assert len(match) == 1
+    user_id = match[0]["id"]
+
+    # Ganti password sendiri (pakai password asli)
+    change = client.put("/api/auth/profile/password", json={
+        "username": username, "old_password": original_password, "new_password": "PasswordBaru456"
+    }, headers=auth(client.post("/api/auth/login", json={
+        "username": username, "password": original_password}).json()["access_token"]))
+    assert change.status_code == 200
+
+    # Ubah peran oleh Admin
+    role_update = client.put(f"/api/auth/operators/{user_id}/role", json={"role": "ADMIN"})
+    assert role_update.status_code == 200
+
+    # Reset password oleh Admin
+    reset = client.put("/api/auth/reset-password", json={"user_id": user_id})
+    assert reset.status_code == 200
+
+    # Hapus akun (cleanup)
+    delete = client.delete(f"/api/auth/operators/{user_id}")
+    assert delete.status_code == 200
+
+def test_feature_H02_ganti_password_sendiri_salah():
+    """H02: Ganti password sendiri dengan password lama yang salah harus ditolak (401)."""
+    username = f"operator_h02_{uuid.uuid4().hex[:8]}"
+    client.post("/api/auth/register", json={"username": username, "password": "PasswordAsli"})
+    response = client.put("/api/auth/profile/password", json={
+        "username": username, "old_password": "PasswordSalah", "new_password": "Baru123"
+    })
+    assert response.status_code == 401
+    # cleanup
+    operators = client.get("/api/auth/operators").json()
+    match = [o for o in operators if o["username"] == username]
+    if match:
+        client.delete(f"/api/auth/operators/{match[0]['id']}")
+
+
+# ============================================================
+# KATEGORI I: FEATURE TEST - LOG AKTIVITAS (logs.py lanjutan)
+# ============================================================
+
+def test_feature_I01_create_log():
+    """I01: Mencatat entri log aktivitas baru secara manual harus berhasil (200)."""
+    response = client.post("/api/logs", json={
+        "operator": "pytest", "action": "Pengujian white box otomatis", "status": "SUCCESS"
+    })
+    assert response.status_code == 200
+    assert response.json()["operator"] == "pytest"
+
+
+# ============================================================
+# KATEGORI K: FEATURE TEST - WEBSOCKET KLIEN (/api/hardware/client/ws)
+# Menguji RoomManager (concurrency lock) secara end-to-end lewat koneksi
+# WebSocket nyata, bukan cuma memeriksa method-nya secara terisolasi.
+# ============================================================
+
+def _login_get_token(username: str, password: str) -> str:
+    resp = client.post("/api/auth/login", json={"username": username, "password": password})
+    assert resp.status_code == 200
+    return resp.json()["access_token"]
+
+def _register_and_login(prefix: str) -> str:
+    username = f"{prefix}_{uuid.uuid4().hex[:8]}"
+    password = "Pass123!"
+    reg = client.post("/api/auth/register", json={"username": username, "password": password})
+    assert reg.status_code == 201
+    return _login_get_token(username, password)
+
+def test_feature_K01_client_ws_tanpa_token_ditolak():
+    """K01: Koneksi WebSocket klien tanpa token harus ditutup dengan close code 4001."""
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect("/api/hardware/client/ws") as ws:
+            ws.receive_text()
+    assert exc_info.value.code == 4001
+
+def test_feature_K02_client_ws_token_tidak_valid_ditolak():
+    """K02: Koneksi WebSocket klien dengan token JWT tidak valid harus ditutup (4001)."""
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect("/api/hardware/client/ws?token=token-ngasal-tidak-valid") as ws:
+            ws.receive_text()
+    assert exc_info.value.code == 4001
+
+def test_feature_K03_client_ws_pilot_lalu_spectator():
+    """K03: Koneksi pertama harus mendapat peran PILOT, koneksi kedua (user lain)
+    harus mendapat peran SPECTATOR — memvalidasi mekanisme concurrency lock."""
+    token1 = _register_and_login("ws_pilot")
+    token2 = _register_and_login("ws_spectator")
+    with client.websocket_connect(f"/api/hardware/client/ws?token={token1}") as ws1:
+        msg1 = ws1.receive_json()
+        assert msg1["event"] == "ROLE_ASSIGNED"
+        assert msg1["role"] == "PILOT"
+        with client.websocket_connect(f"/api/hardware/client/ws?token={token2}") as ws2:
+            msg2 = ws2.receive_json()
+            assert msg2["role"] == "SPECTATOR"
+
+def _receive_until(ws, predicate, max_tries=6):
+    """Terima pesan berturut-turut sampai predicate terpenuhi atau koneksi tertutup.
+    Dipakai agar test tahan terhadap pesan tambahan (mis. ROOM_STATE_UPDATE) yang
+    bisa menyelip di antara pesan yang benar-benar ingin diperiksa."""
+    for _ in range(max_tries):
+        try:
+            msg = ws.receive_json()
+        except WebSocketDisconnect:
+            return None
+        if predicate(msg):
+            return msg
+    return None
+
+def test_feature_K04_client_ws_maksimal_3_perangkat_per_user():
+    """K04: Perangkat ke-4 dengan username yang SAMA harus ditolak — server mengirim
+    pesan MAX_DEVICES_REACHED terlebih dahulu sebelum menutup koneksi (close 1008)."""
+    token = _register_and_login("ws_multi")
+    url = f"/api/hardware/client/ws?token={token}"
+    with client.websocket_connect(url) as ws1:
+        ws1.receive_json()
+        with client.websocket_connect(url) as ws2:
+            ws2.receive_json()
+            with client.websocket_connect(url) as ws3:
+                ws3.receive_json()
+                with client.websocket_connect(url) as ws4:
+                    reject_msg = _receive_until(ws4, lambda m: m.get("role") == "MAX_DEVICES_REACHED")
+                    assert reject_msg is not None, "Tidak menerima pesan MAX_DEVICES_REACHED"
+
+def test_feature_K05_room_admin_action_kick_sesi_nyata():
+    """K05: Memanggil endpoint REST admin_action(KICK) harus benar-benar memutus
+    koneksi WebSocket target yang sedang aktif — bukti integrasi REST -> WebSocket."""
+    token = _register_and_login("ws_kick")
+    with client.websocket_connect(f"/api/hardware/client/ws?token={token}") as ws:
+        role_msg = ws.receive_json()
+        assert role_msg["role"] == "PILOT"
+        state_msg = _receive_until(ws, lambda m: m.get("event") == "ROOM_STATE_UPDATE")
+        assert state_msg is not None, "Tidak menerima ROOM_STATE_UPDATE"
+        cid = state_msg["pilot"]["cid"]
+
+        response = client.post("/api/hardware/room/admin_action", json={"cid": cid, "action": "KICK"})
+        assert response.status_code == 200
+        assert response.json()["status"] == "SUCCESS"
+
+        kick_msg = _receive_until(ws, lambda m: m.get("role") == "KICKED_BY_ADMIN")
+        assert kick_msg is not None, "Tidak menerima pesan KICKED_BY_ADMIN setelah admin_action"
+
+
+# ============================================================
+# KATEGORI L: FEATURE TEST - WEBSOCKET EDGE DEVICE (/api/hardware/ws)
+# Membuktikan register_jetson()/unregister_jetson() benar-benar mengubah
+# perilaku endpoint kendali motor secara langsung (bukan cuma unit-level).
+# ============================================================
+
+def _move_grbl_response():
+    resp = client.post("/api/hardware/motor/move", json={
+        "axis": "Z", "value": 1.0, "feed_rate": 100.0, "unit": "mm"
+    })
+    if resp.status_code == 429:
+        return "RATE_LIMITED"  # guard 0.5 detik dari pengujian QoS sebelumnya
+    return resp.json()["grbl_response"]
+
+def _wait_until_registered():
+    """register_jetson() baru berjalan SETELAH get_redis_client() selesai. Fungsi itu
+    melakukan socket.connect() SINKRON (blocking) dengan timeout 2 detik sebelum
+    fallback ke MockRedis ketika Redis asli tak ditemukan di REDIS_URL -- temuan
+    white-box: event loop tertahan hingga ~2 detik per koneksi Edge baru. Jeda di
+    sini sengaja melebihi 2 detik itu, sekaligus tetap menghormati guard rate-limit
+    0.5 detik pada motor/move yang sudah diuji pada pengujian QoS sebelumnya."""
+    time.sleep(2.3)
+    return _move_grbl_response()
+
+def test_feature_L01_edge_ws_registrasi_meneruskan_perintah_motor():
+    """L01: Selama Edge terhubung via WebSocket, perintah motor harus diteruskan
+    (grbl_response == 'ok'), bukan lagi 'Edge Device Offline'."""
+    with client.websocket_connect(EDGE_WS):
+        result = _wait_until_registered()
+        assert result == "ok"
+
+def test_feature_L02_edge_ws_unregister_setelah_disconnect():
+    """L02: Setelah koneksi Edge terputus, perintah motor harus kembali
+    melaporkan Edge Device Offline (motor_driver ter-unregister dengan benar)."""
+    with client.websocket_connect(EDGE_WS):
+        pass  # koneksi langsung ditutup di akhir blok 'with'
+    time.sleep(0.6)  # lewati guard rate-limit 0.5 dtk dari perintah motor di tes sebelumnya
+    response = client.post("/api/hardware/motor/move", json={
+        "axis": "Z", "value": 1.0, "feed_rate": 100.0, "unit": "mm"
+    })
+    assert response.status_code == 200
+    assert "Offline" in response.json()["grbl_response"]
+
+def test_feature_L03_edge_ws_kirim_telemetry_koneksi_tetap_hidup():
+    """L03: Edge mengirim event TELEMETRY_DATA harus diproses tanpa memutus koneksi,
+    dibuktikan dengan pengiriman event kedua yang masih berhasil setelahnya."""
+    with client.websocket_connect(EDGE_WS) as ws:
+        assert _wait_until_registered() == "ok"
+        ws.send_json({"event": "TELEMETRY_DATA", "position": {"X": 1.0, "Y": 2.0, "Z": 0.0}})
+        ws.send_json({"event": "MOTOR_MOVED", "grbl_response": "ok"})
+        # Koneksi masih hidup jika perintah motor lewat REST tetap berhasil diteruskan.
+        # Jeda >0.5s lagi supaya tidak kena guard rate-limit dari panggilan sebelumnya.
+        time.sleep(0.6)
+        assert _move_grbl_response() == "ok"
+
+
+
+
+def test_feature_L04_edge_ws_menerima_heartbeat_ping():
+    """L04: VPS harus mengirim PING berkala ke Jetson; ini sumber data watchdog B2."""
+    with client.websocket_connect(EDGE_WS) as ws:
+        assert ws.receive_json() == {"action": "PING"}
+
+
+def test_feature_L05_edge_putus_membatalkan_scan_berjalan():
+    """L05: Saat Jetson putus, scan yang sedang berjalan harus dibatalkan."""
+    from app.routers.hardware import _scan_state
+    _scan_state.update({"running": True, "cancel": False})
+    try:
+        with client.websocket_connect(EDGE_WS):
+            pass
+        assert _scan_state["cancel"] is True
+    finally:
+        _scan_state.update({"running": False, "cancel": False})
+
+
+def test_feature_G14_retake_edge_offline_504_tanpa_gambar_palsu():
+    """G14: Retake saat Edge offline harus 504 dan tidak boleh membuat gambar pengganti."""
+    name = f"retake_{uuid.uuid4().hex[:8]}.jpg"
+    response = client.post("/api/hardware/scan/retake", json={
+        "coord_x": 0.0, "coord_y": 0.0, "filename": name, "delay_ms": 0})
+    assert response.status_code == 504
+    assert not os.path.exists(os.path.join("static", "uploads", name))
+
+
+def test_feature_G15_retake_edge_tidak_kirim_citra_504(monkeypatch):
+    """G15: Edge online tetapi citra tidak tiba: 504, dan tile lama tetap utuh."""
+    from app.routers import hardware
+    monkeypatch.setattr(hardware, "RETAKE_TIMEOUT_S", 0.3)
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(hardware.asyncio, "sleep", lambda s: real_sleep(min(s, 0.01)))
+    name = f"retake_{uuid.uuid4().hex[:8]}.jpg"
+    path = os.path.join("static", "uploads", name)
+    with open(path, "wb") as f:
+        f.write(b"lama")
+    monkeypatch.setattr(hardware.motor_driver, "jetson_websocket", object())
+    response = client.post("/api/hardware/scan/retake", json={
+        "coord_x": 0.0, "coord_y": 0.0, "filename": name, "delay_ms": 0})
+    assert response.status_code == 504
+    with open(path, "rb") as f:
+        assert f.read() == b"lama"
+
+
+def test_feature_E06_fallback_lokal_ditandai_source():
+    """E06: Respons fallback lokal saat Edge offline harus menyertakan source."""
+    upload = client.post("/api/analysis/upload", files={"file": ("a.jpg", _make_test_image_bytes(), "image/jpeg")})
+    response = client.post("/api/analysis/sobel", json={
+        "filename": upload.json()["filename"], "current_src": "", "params": {}})
+    assert response.status_code == 200
+    assert response.json()["source"] == "local_fallback"
+
+
+def test_feature_C10_telemetri_edge_offline_null():
+    """C10: Tanpa Jetson, nilai edge harus null, bukan angka palsu."""
+    data = client.get("/api/hardware/telemetry/stats").json()
+    assert data["edgeOnline"] is False
+    assert data["edgeCpu"] is None and data["edgeRam"] is None and data["edgeTemp"] is None
+
+
+def test_feature_C11_telemetri_edge_nilai_asli_dari_jetson():
+    """C11: Nilai edge berasal dari TELEMETRY_DATA terakhir, dan hilang saat Jetson putus."""
+    with client.websocket_connect(EDGE_WS) as ws:
+        ws.send_json({"event": "TELEMETRY_DATA", "edge_cpu_usage": 12.5, "ram_usage": "2.00/8.00 GB",
+                      "jetson_temperatures": {"cpu": 51.0, "gpu": 48.0}, "position": {"X": 1, "Y": 2, "Z": 3}})
+        for _ in range(50):
+            data = client.get("/api/hardware/telemetry/stats").json()
+            if data["edgeCpu"] is not None:
+                break
+            time.sleep(0.05)
+        assert data["edgeOnline"] is True
+        assert (data["edgeCpu"], data["edgeRam"], data["edgeTemp"]) == (12.5, 25.0, 51.0)
+    data = client.get("/api/hardware/telemetry/stats").json()
+    assert data["edgeOnline"] is False and data["edgeCpu"] is None
+
+
+def test_feature_B10_health_melaporkan_status_nyata():
+    """B10: Tanpa Jetson, health check tidak boleh mengaku CONNECTED."""
+    hw = client.get("/").json()["hardware"]
+    assert hw == {"jetson_orin_nano": "OFFLINE", "grbl_core": "OFFLINE"}
+
+
+def test_feature_G16_scan_ditolak_kalau_cnc_offline():
+    """G16: Jetson tersambung tetapi CNC tidak: scan ditolak, kamera tidak memotret tempat yang sama."""
+    with client.websocket_connect(EDGE_WS) as ws:
+        ws.send_json({"event": "TELEMETRY_DATA", "status": "Offline", "position": {"X": 0, "Y": 0, "Z": 0}})
+        for _ in range(50):
+            if client.get("/").json()["hardware"]["grbl_core"] == "Offline":
+                break
+            time.sleep(0.05)
+        response = client.post("/api/hardware/scan/grid", json={
+            "columns": 1, "rows": 1, "step_x": 1.0, "step_y": 1.0, "delay_ms": 0,
+            "unit": "mm", "start_x": 0.0, "start_y": 0.0})
+        move = client.post("/api/hardware/motor/move", json={"axis": "X", "value": 1.0, "feed_rate": 250.0, "unit": "mm"})
+    assert response.status_code == 409
+    assert "CNC" in response.json()["detail"]
+    assert move.status_code == 409
+
+
+# ============================================================
+# KATEGORI J: PURGE. Aman dijalankan karena tes memakai DB dan folder sementara.
+# ============================================================
+@pytest.fixture
+def purge_world():
+    from app import models
+    from app.database import SessionLocal
+    created = client.post("/api/dataset/folders", json={
+        "name": f"purge_{uuid.uuid4().hex[:8]}", "object_type": "uji", "date": "2026-11-05", "operator": "uji"})
+    folder_id = created.json()["id"]
+    dataset = os.path.join("static", "datasets", folder_id)
+    paths = {
+        "dataset": os.path.join(dataset, "tile_r0_c0.jpg"),
+        "temp": os.path.join(dataset, "_temp_video.mp4"),
+        "upload": os.path.join("static", "uploads", "IMG_sesi_r0_c0.jpg"),
+        "sidecar": os.path.join("static", "uploads", "yolo_a.json"),
+        "zip": os.path.join("static", "datasets", "abc_123.zip"),
+    }
+    for path in paths.values():
+        with open(path, "wb") as f:
+            f.write(b"x")
+    client.post("/api/logs", json={"operator": "uji", "action": "aksi uji", "status": "SUCCESS"})
+    db = SessionLocal()
+    db.merge(models.SystemSetting(key="uji_purge", value="1"))
+    db.commit()
+    db.close()
+    yield folder_id, paths
+
+
+def _counts():
+    from app import models
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
+        return {m.__name__: db.query(m).count() for m in (models.User, models.SystemLog, models.SystemSetting, models.DatasetFolder)}
+    finally:
+        db.close()
+
+
+def test_feature_J01_purge_cache_tidak_menyentuh_dataset_dan_database(purge_world):
+    folder_id, paths = purge_world
+    before = _counts()
+    assert client.delete("/api/dataset/storage/purge-cache").status_code == 200
+    assert os.path.exists(paths["dataset"])
+    for key in ("temp", "upload", "sidecar", "zip"):
+        assert not os.path.exists(paths[key]), key
+    assert _counts() == before
+    assert any(f["id"] == folder_id for f in client.get("/api/dataset/folders").json())
+
+
+def test_feature_J02_purge_all_hanya_dataset_akun_log_setting_utuh(purge_world):
+    folder_id, paths = purge_world
+    before = _counts()
+    assert client.delete("/api/dataset/storage/purge-all").status_code == 200
+    assert not os.path.exists(paths["dataset"])
+    assert os.path.isdir(os.path.join("static", "datasets"))
+    after = _counts()
+    assert after["DatasetFolder"] == 0
+    for table in ("User", "SystemLog", "SystemSetting"):
+        assert after[table] == before[table], table
+
+
+@pytest.mark.parametrize("path", ["/api/dataset/storage/purge-cache", "/api/dataset/storage/purge-all"])
+def test_feature_J03_purge_ditolak_saat_scan_berjalan(purge_world, path):
+    from app.routers.hardware import _scan_state
+    _, paths = purge_world
+    _scan_state["running"] = True
+    try:
+        assert client.delete(path).status_code == 409
+    finally:
+        _scan_state["running"] = False
+    assert os.path.exists(paths["dataset"]) and os.path.exists(paths["upload"])
+
+
+def test_feature_J04_unduhan_zip_tidak_menumpuk(purge_world):
+    folder_id, paths = purge_world
+    os.remove(paths["zip"])
+    assert client.get(f"/api/dataset/folders/{folder_id}/download").status_code == 200
+    assert client.get("/api/dataset/storage/export").status_code == 200
+    root = os.path.join("static", "datasets")
+    assert [f for f in os.listdir(root) if f.endswith(".zip")] == []
+
+
+def test_feature_G17_hapus_sesi_hanya_sesi_itu():
+    from app.routers.hardware import _scan_state
+    uploads = os.path.join("static", "uploads")
+    keep = os.path.join(uploads, "IMG_lain_r0_c0.jpg")
+    drop = os.path.join(uploads, "IMG_sesiA_r1_c2.jpg")
+    other = os.path.join(uploads, "stitched_ta_output.jpg")
+    for path in (keep, drop, other):
+        with open(path, "wb") as f:
+            f.write(b"x")
+    assert client.delete("/api/hardware/scan/session/..%2F..%2Fapp").status_code in (400, 404)
+    assert client.delete("/api/hardware/scan/session/sesi*").status_code == 400
+    _scan_state.update({"running": True, "session": "sesiA"})
+    try:
+        assert client.delete("/api/hardware/scan/session/sesiA").status_code == 409
+    finally:
+        _scan_state.update({"running": False, "session": None})
+    res = client.delete("/api/hardware/scan/session/sesiA")
+    assert res.status_code == 200 and res.json()["deleted"] == 1
+    assert not os.path.exists(drop) and os.path.exists(keep) and os.path.exists(other)
+
+
+def test_feature_G18_scan_melaporkan_tile_gagal():
+    from app.routers import hardware
+    start = client.post("/api/hardware/scan/grid", json={
+        "columns": 1, "rows": 1, "step_x": 1.0, "step_y": 1.0, "delay_ms": 0,
+        "unit": "mm", "start_x": 0.0, "start_y": 0.0})
+    assert start.status_code == 200
+    for _ in range(50):
+        status = client.get("/api/hardware/scan/status").json()
+        if not status["running"]:
+            break
+        time.sleep(0.1)
+    assert status["total"] == 1
+    assert "captured" in status and "failed" in status
+
+
+def _poll_analysis_status(output, timeout_s=5.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        status = client.get("/api/analysis/status", params={"output": output}).json()
+        if status.get("done") or status.get("error"):
+            return status
+        time.sleep(0.1)
+    return status
+
+
+def test_feature_L06_cv_result_colony_area_histogram_dan_csv_tersimpan():
+    """L06: CV_RESULT colony-count dari Edge membawa luas koloni + histogram PNG +
+    CSV per koloni; ketiganya harus tersimpan dan muncul di /analysis/status."""
+    import base64 as b64
+    ok, png = cv2.imencode(".png", np.zeros((8, 8, 3), np.uint8))
+    jpg = b64.b64encode(_make_test_image_bytes().getvalue()).decode()
+    area = {"unit": "mm²", "length_unit": "mm", "n": 2, "calibrated": True,
+            "scale": {"um_per_px_x": 7.0, "um_per_px_y": 7.0, "source": "camera tile 7 um/px @ 900x506px"},
+            "total": 0.5, "mean": 0.25, "median": 0.25, "min": 0.2, "max": 0.3,
+            "mean_eq_diameter": 0.56, "hist_counts": [1, 1], "hist_edges": [0.2, 0.25, 0.3]}
+    with client.websocket_connect(EDGE_WS) as ws:
+        assert _wait_until_registered() == "ok"
+        ws.send_json({
+            "event": "CV_RESULT", "status": "SUCCESS", "filename": "yolo_uji_area.jpg",
+            "image_data": f"data:image/jpeg;base64,{jpg}", "colonies": 2, "area": area,
+            "histogram_data": "data:image/png;base64," + b64.b64encode(png.tobytes()).decode(),
+            "histogram_filename": "yolo_uji_area_area_hist.png",
+            "areas_csv": "id,area_mm²\n1,0.2\n2,0.3\n", "areas_csv_filename": "yolo_uji_area_areas.csv",
+        })
+        status = _poll_analysis_status("yolo_uji_area.jpg")
+    assert status["done"] is True
+    assert status["colonies"] == 2
+    assert status["area"]["unit"] == "mm²" and status["area"]["n"] == 2
+    assert status["area"]["histogram_url"] == "/static/uploads/yolo_uji_area_area_hist.png"
+    assert status["area"]["areas_csv_url"] == "/static/uploads/yolo_uji_area_areas.csv"
+    assert client.get(status["area"]["histogram_url"]).content == png.tobytes()
+    assert "1,0.2" in client.get(status["area"]["areas_csv_url"]).text
+
+
+def test_feature_L07_cv_result_nama_export_luas_disaring():
+    """L07: Nama histogram/CSV dari Edge tidak boleh keluar dari static/uploads
+    dan ekstensinya harus sesuai (.png / .csv)."""
+    from app.routers.hardware import _save_area_exports
+    urls = _save_area_exports({
+        "histogram_filename": "../../luar.png", "histogram_data": "data:image/png;base64,AAAA",
+        "areas_csv_filename": "skrip.sh", "areas_csv": "x",
+    })
+    assert urls == {"histogram_url": "/static/uploads/luar.png"}
+    assert os.path.exists("static/uploads/luar.png")
+    assert not os.path.exists("luar.png") and not os.path.exists("static/uploads/skrip.sh")
+
+
+def test_feature_L08_cv_result_morfologi_yolo_membawa_luas():
+    """L08: Kalkulasi Morfologi kini dihitung dari mask YOLO di Edge: CV_RESULT
+    membawa stats (satuan mm²) + luas/histogram; status harus memisahkan
+    keduanya (stats tanpa kunci area, area dengan URL histogram)."""
+    import base64 as b64
+    ok, png = cv2.imencode(".png", np.zeros((8, 8, 3), np.uint8))
+    jpg = b64.b64encode(_make_test_image_bytes().getvalue()).decode()
+    stats = {"method": "YOLO segmentation (besttt_FP16.engine)", "unit": "mm²", "length_unit": "mm",
+             "total_cells": 3, "total_area": 0.6, "avg_area": 0.2, "median_area": 0.2,
+             "avg_perimeter": 1.6, "avg_eq_diameter": 0.5, "avg_circularity": 0.9}
+    area = {"unit": "mm²", "n": 3, "total": 0.6, "mean": 0.2, "median": 0.2, "min": 0.1, "max": 0.3}
+    with client.websocket_connect(EDGE_WS) as ws:
+        assert _wait_until_registered() == "ok"
+        ws.send_json({
+            "event": "CV_RESULT", "status": "SUCCESS", "filename": "edited_morphology_uji.jpg",
+            "image_data": f"data:image/jpeg;base64,{jpg}", "stats": stats, "area": area,
+            "histogram_data": "data:image/png;base64," + b64.b64encode(png.tobytes()).decode(),
+            "histogram_filename": "edited_morphology_uji_area_hist.png",
+        })
+        status = _poll_analysis_status("edited_morphology_uji.jpg")
+    assert status["done"] is True
+    assert status["stats"] == stats
+    assert status["area"]["n"] == 3
+    assert status["area"]["histogram_url"] == "/static/uploads/edited_morphology_uji_area_hist.png"

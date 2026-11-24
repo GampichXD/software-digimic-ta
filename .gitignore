@@ -1,0 +1,58 @@
+# Abaikan folder virtual environment
+backend/venv/
+backend/env/
+backend/ENV/
+backend/.venv/
+venv/
+.venv/
+
+# Abaikan semua cache Python di seluruh sub-folder
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*$py.class
+
+# Abaikan file database lokal jika ada
+backend/*.db
+backend/*.sqlite3
+
+# Abaikan file log
+*.log
+
+# Abaikan environment variables rahasia
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# OS sampah & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Abaikan dataset gambar & upload hasil capture & analisis (Heavy Files)
+backend/static/datasets/*
+!backend/static/datasets/.gitkeep
+backend/static/uploads/*
+!backend/static/uploads/.gitkeep
+
+# Node modules & build output
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+
+# Keluaran pengujian
+backend/.coverage
+backend/.pytest_cache/
+backend/test.zip
+.hypothesis/
+frontend/test-results/
+frontend/playwright-report/
+frontend/e2e-results.json
+frontend/coverage/
+qa/results/

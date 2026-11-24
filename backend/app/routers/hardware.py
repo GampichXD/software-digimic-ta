@@ -1,0 +1,1754 @@
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request, HTTPException, Query, Depends, UploadFile, File, Form
+from jose import jwt, JWTError
+from sqlalchemy.orm import Session
+from ..database import get_db
+from .. import models
+from ..services.auth_service import SECRET_KEY, ALGORITHM
+from ..schemas import MotorMovePayload, CameraSettingsPayload, HardwareBusTogglePayload, CncSettingsPayload, SoftLimitsPayload, GridScanPayload, StitchPayload, RetakePayload, AiConfigPayload, AdminRoomActionPayload, InputTileFromDataset, SetPositionPayload, AutoGatherDefaults, PlaceFolderPayload
+import time
+import json
+import asyncio
+import os
+import re
+import shutil
+import base64
+import glob
+import psutil
+import uuid
+import logging
+from redis import asyncio as aioredis  # Driver Redis Asinkron untuk ekosistem Docker
+
+from ..hardware.motor_driver import motor_driver
+from ..hardware.camera_driver import cam_driver as camera_driver
+from ..redis_mock import get_redis_client
+from ..services import cv_bus
+from ..services import presence
+from ..services.deps import edge_token_required, edge_token_valid, get_current_user, require_admin
+from ..services.client_outbox import ClientOutbox
+from ..services.safe_path import safe_join, safe_name
+from ..services.scan_planner import DEFAULT_FEED_RATE_MM_MIN, ROW_CHANGE_SETTLE_S, compute_delay, plan_serpentine
+
+router = APIRouter(prefix="/api/hardware", tags=["Hardware"])
+logger = logging.getLogger(__name__)
+
+# URL Jaringan internal untuk kontainer Redis di dalam docker-compose.yml
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
+
+EDGE_HEARTBEAT_INTERVAL_S = 1.0
+RETAKE_TIMEOUT_S = 15.0
+
+# Saklar logis untuk menonaktifkan semua kontrol hardware dari panel admin.
+hardware_bus_enabled = True
+
+# 🟢 FIX 1: Deklarasikan direktori penyimpanan static uploads agar bebas dari NameError
+UPLOAD_DIR = "./static/uploads"
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
+
+DATASET_DIR = "./static/datasets"
+
+
+def _save_area_exports(data: dict) -> dict:
+    """Simpan histogram luas koloni (PNG) dan CSV per-koloni dari CV_RESULT
+    colony-count ke UPLOAD_DIR. Return URL-nya untuk sidecar .json.
+    Nama dari Edge disaring dan ekstensinya dipaksa (.png / .csv)."""
+    urls = {}
+    exports = (("histogram_filename", "histogram_data", ".png", "histogram_url"),
+               ("areas_csv_filename", "areas_csv", ".csv", "areas_csv_url"))
+    for name_key, data_key, ext, url_key in exports:
+        name = os.path.basename(str(data.get(name_key) or ""))
+        payload = data.get(data_key)
+        if not name or not payload or not name.lower().endswith(ext):
+            continue
+        try:
+            if ext == ".png":
+                raw = base64.b64decode(str(payload).split(",", 1)[-1])
+            else:
+                raw = str(payload).encode("utf-8")
+            with open(os.path.join(UPLOAD_DIR, name), "wb") as f:
+                f.write(raw)
+            urls[url_key] = f"/static/uploads/{name}"
+        except Exception as err:
+            print(f"[VPS STORAGE ERROR] Gagal menyimpan {name}: {err}")
+    return urls
+
+# Model tile stitching yang didukung -> backend cfg SP_LG.
+STITCH_MODELS = {"sp_lg_tensorrt", "sift_bfm", "sift_lg", "brute_force"}
+
+
+async def publish_hardware_command(payload: dict) -> None:
+    redis = await get_redis_client(REDIS_URL)
+    try:
+        await redis.publish("hardware_commands", json.dumps(payload))
+    finally:
+        await redis.close()
+
+# Dictionary internal untuk mencatat timestamp perintah gerak terakhir per username
+last_command_time = {}
+
+
+def get_client_ip(request: Request) -> str:
+    """IP asli pengguna di balik Cloudflare dan nginx. Header bisa dipalsukan kalau
+    backend diakses langsung, jadi jangan dipakai untuk keputusan keamanan."""
+    forwarded = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    return (request.headers.get("CF-Connecting-IP")
+            or request.headers.get("X-Real-IP")
+            or forwarded
+            or (request.client.host if request.client else "unknown"))
+
+
+def is_local_network(ip_address: str) -> bool:
+    """Mengecek apakah IP user berasal dari jaringan lokal Jetson (Localhost/Private Subnet)."""
+    if ip_address in ["127.0.0.1", "localhost", "::1"]:
+        return True
+    if ip_address.startswith("192.168.") or ip_address.startswith("10."):
+        return True
+    return False
+
+def ensure_pilot(user: models.User) -> None:
+    """Lock Pilot di REST. Admin selalu boleh. Kalau kursi Pilot kosong (tidak ada klien
+    WS sama sekali), siapa pun boleh, supaya fallback REST tidak mengunci sistem."""
+    if (user.role or "").upper() == "ADMIN":
+        return
+    pilot = room_manager.pilot
+    if pilot is not None and pilot["username"] != user.username:
+        raise HTTPException(status_code=409, detail="Anda bukan Pilot")
+
+
+# ====================================================================
+# 0. ROUTE HTTP GET: TELEMETRI & STATISTIK SERVER
+# ====================================================================
+# Telemetri terakhir yang diterima dari Jetson (event TELEMETRY_DATA di /ws).
+last_edge_telemetry = {}
+
+
+def _ram_percent(ram_usage):
+    """'5.12/7.62 GB' -> 67.2. None kalau formatnya tidak terbaca."""
+    try:
+        used, total = str(ram_usage).replace(" GB", "").split("/")
+        return round(float(used) / float(total) * 100, 1)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def edge_stats() -> dict:
+    online = motor_driver.jetson_websocket is not None
+    if not online or not last_edge_telemetry:
+        return {"edgeOnline": online, "edgeCpu": None, "edgeRam": None, "edgeTemp": None}
+    temps = last_edge_telemetry.get("jetson_temperatures") or {}
+    return {
+        "edgeOnline": True,
+        "edgeCpu": last_edge_telemetry.get("edge_cpu_usage"),
+        "edgeRam": _ram_percent(last_edge_telemetry.get("ram_usage")),
+        "edgeTemp": temps.get("cpu"),
+    }
+
+
+last_net_io = psutil.net_io_counters()
+last_net_time = time.time()
+
+# Sengaja publik: frontend membaca hardwareBus dari sini sebelum login untuk menyalakan
+# kontrol dan WebSocket. Kalau diproteksi, semuanya tertunda hingga 3 detik setelah login.
+@router.get("/telemetry/stats")
+async def get_telemetry_stats():
+    global last_net_io, last_net_time
+    
+    current_net_io = psutil.net_io_counters()
+    current_time = time.time()
+    
+    dt = current_time - last_net_time
+    bandwidth_mbps = 0.0
+    if dt > 0:
+        bytes_sent = current_net_io.bytes_sent - last_net_io.bytes_sent
+        bytes_recv = current_net_io.bytes_recv - last_net_io.bytes_recv
+        total_bytes_per_sec = (bytes_sent + bytes_recv) / dt
+        bandwidth_mbps = (total_bytes_per_sec * 8) / 1_000_000
+        
+    last_net_io = current_net_io
+    last_net_time = current_time
+
+    """Statistik VPS + telemetri terakhir dari Jetson (null kalau Jetson offline)."""
+    return {
+        "serverCpu": psutil.cpu_percent(interval=None),
+        "serverRam": psutil.virtual_memory().percent,
+        "serverBandwidth": round(bandwidth_mbps, 2),
+        **edge_stats(),
+        "hardwareBus": hardware_bus_enabled
+    }
+
+def _setting_float(db: Session, key: str, default: float, minimum: float = 1e-6) -> float:
+    """Baca SystemSetting angka. Nilai kosong, rusak, atau di bawah `minimum` memakai default."""
+    row = db.query(models.SystemSetting).filter_by(key=key).first()
+    try:
+        value = float(row.value) if row and row.value not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+def save_setting(db: Session, key: str, value: str):
+    setting = db.query(models.SystemSetting).filter_by(key=key).first()
+    if setting:
+        setting.value = value
+    else:
+        setting = models.SystemSetting(key=key, value=value)
+        db.add(setting)
+    db.commit()
+
+@router.get("/config", dependencies=[Depends(get_current_user)])
+async def get_system_config(db: Session = Depends(get_db)):
+    settings = db.query(models.SystemSetting).all()
+    config_dict = {s.key: s.value for s in settings}
+    return config_dict
+
+@router.put("/config/ai", dependencies=[Depends(require_admin)])
+async def set_ai_config(payload: AiConfigPayload, db: Session = Depends(get_db)):
+    # Hanya ambang keyakinan (confidence). Pemilihan model YOLO dihapus —
+    # Edge memakai bobot tunggal best_Seg_1280_int8.engine.
+    save_setting(db, "confThreshold", str(payload.confThreshold))
+    return {"message": "AI confidence threshold updated", "confThreshold": payload.confThreshold}
+
+
+_AG_KEYS = {
+    "columns": "ag_columns", "rows": "ag_rows", "step_x": "ag_step_x",
+    "step_y": "ag_step_y", "z_step": "ag_z_step", "delay_ms": "ag_delay_ms",
+    "unit": "ag_unit", "model": "ag_model", "auto_stitch": "ag_auto_stitch",
+}
+
+
+@router.put("/config/autogather", dependencies=[Depends(require_admin)])
+async def set_autogather_defaults(payload: AutoGatherDefaults, db: Session = Depends(get_db)):
+    """ADMIN: simpan nilai default parameter Auto-Gather. Frontend Image
+    Gathering membacanya dari GET /config (kunci berawalan ag_) saat memuat tab."""
+    d = payload.dict()
+    saved = {}
+    for field, key in _AG_KEYS.items():
+        val = d.get(field)
+        if val is None:
+            continue
+        save_setting(db, key, ("1" if val else "0") if field == "auto_stitch" else str(val))
+        saved[key] = val
+    return {"message": "Default Auto-Gather disimpan.", "saved": saved}
+
+@router.post("/config/{section}/default", dependencies=[Depends(require_admin)])
+async def reset_config_default(section: str, db: Session = Depends(get_db)):
+    # Hapus semua record yang berhubungan dengan section dari db
+    # Untuk simulasi: reset tidak benar-benar menghapus, biarkan default fallback dari frontend 
+    # Atau kita bisa mendelete row-row tersebut
+    keys_to_delete = []
+    if section.lower() == 'cnc':
+        keys_to_delete = ['feedRate', 'backlash', 'acceleration', 'settle_time']
+    elif section.lower() == 'camera':
+        keys_to_delete = ['cameraRes', 'cameraFps', 'exposure', 'videoSource', 'shutter_speed']
+    elif section.lower() == 'ai':
+        keys_to_delete = ['aiModel', 'confThreshold']
+    elif section.lower() == 'network':
+        keys_to_delete = ['ipBinding', 'apiPort']
+        
+    for k in keys_to_delete:
+        db.query(models.SystemSetting).filter_by(key=k).delete()
+    db.commit()
+
+    # Kirim nilai bawaan ke Jetson juga; sebelumnya hanya database yang dikosongkan sehingga
+    # kamera/GRBL tetap memakai nilai lama.
+    if section.lower() == 'cnc':
+        await _push_cnc(dict(CNC_DEFAULTS))
+    elif section.lower() == 'camera':
+        await publish_hardware_command({"action": "APPLY_CAMERA_SETTINGS", **CAMERA_DEFAULTS})
+
+    return {"message": f"Config {section} reset to default"}
+
+@router.post("/room/admin_action", dependencies=[Depends(require_admin)])
+async def perform_admin_action(payload: AdminRoomActionPayload):
+    success = await room_manager.admin_action(payload.cid, payload.action)
+    if success:
+        return {"status": "SUCCESS", "message": f"Action {payload.action} executed on {payload.cid}"}
+    raise HTTPException(status_code=404, detail="Connection ID not found")
+
+# ====================================================================
+# 1. ROUTE HTTP POST: UNTUK KENDALI MOTOR D-PAD MANUAL USER
+# ====================================================================
+@router.post("/motor/move")
+async def move_motor(payload: MotorMovePayload, request: Request, user: models.User = Depends(get_current_user)):
+    if not hardware_bus_enabled:
+        raise HTTPException(status_code=503, detail="Hardware bus sedang nonaktif.")
+    ensure_pilot(user)
+
+    user_ip = get_client_ip(request)
+
+    # Pecahan properti frontend disusun ke dalam gcode_str
+    axis_letter = payload.axis.upper()
+    if axis_letter not in ("X", "Y", "Z"):
+        raise HTTPException(status_code=400, detail="Sumbu harus X, Y, atau Z.")
+    gcode_str = f"G1 {axis_letter}{payload.value} F{payload.feed_rate}"
+
+    # Guard dikunci per username: IP bisa sama untuk banyak pengguna di balik proxy,
+    # dan header IP bisa dipalsukan kalau dipakai sebagai pengecualian.
+    if not check_motor_rate_limit(user.username, time.time(), channel="rest"):
+        print(f"[GUARD WARNING] Perintah dari {user.username} diblokir sementara (Over-speed).")
+        raise HTTPException(
+            status_code=429,
+            detail="Perintah terlalu cepat! Mohon beri jeda transmisi internet demi keamanan mekanik CNC."
+        )
+
+    ensure_cnc_online()
+    print(f"[NETWORK DETECTOR] {user.username} dari {user_ip}. Eksekusi: {gcode_str}")
+    response = await motor_driver.send_gcode(gcode_str)
+    mode = "LOCAL" if is_local_network(user_ip) else "REMOTE_GUARDED"
+    return {"status": "SUCCESS", "mode": mode, "grbl_response": response}
+
+
+@router.post("/motor/home")
+async def home_motor(request: Request, user: models.User = Depends(get_current_user)):
+    if not hardware_bus_enabled:
+        raise HTTPException(status_code=503, detail="Hardware bus sedang nonaktif.")
+    ensure_pilot(user)
+    ensure_cnc_online()
+
+    user_ip = get_client_ip(request)
+    if is_local_network(user_ip):
+        response = await motor_driver.home()
+        return {"status": "SUCCESS", "mode": "LOCAL", "grbl_response": response}
+
+    await publish_hardware_command({"action": "HOMING"})
+    return {"status": "SUCCESS", "mode": "REMOTE", "action": "HOMING"}
+
+
+@router.post("/motor/unlock")
+async def unlock_motor(request: Request, user: models.User = Depends(get_current_user)):
+    if not hardware_bus_enabled:
+        raise HTTPException(status_code=503, detail="Hardware bus sedang nonaktif.")
+    ensure_pilot(user)
+    ensure_cnc_online()
+
+    user_ip = get_client_ip(request)
+    if is_local_network(user_ip):
+        response = await motor_driver.send_gcode("$X")
+        return {"status": "SUCCESS", "mode": "LOCAL", "grbl_response": response}
+
+    await publish_hardware_command({"action": "UNLOCK"})
+    return {"status": "SUCCESS", "mode": "REMOTE", "action": "UNLOCK"}
+
+
+@router.post("/motor/set-position", dependencies=[Depends(require_admin)])
+async def set_motor_position(payload: SetPositionPayload):
+    """ADMIN: tulis ulang koordinat kerja (motor_position.json di Edge) tanpa
+    menggerakkan motor. Edge mengirim G92 ke GRBL lalu mem-persist JSON."""
+    if not hardware_bus_enabled:
+        raise HTTPException(status_code=503, detail="Hardware bus sedang nonaktif.")
+    await publish_hardware_command({
+        "action": "SET_POSITION", "x": payload.x, "y": payload.y, "z": payload.z,
+    })
+    return {"status": "SUCCESS", "action": "SET_POSITION",
+            "position": {"X": payload.x, "Y": payload.y, "Z": payload.z}}
+
+
+@router.post("/edge/restart", dependencies=[Depends(require_admin)])
+async def restart_edge_service():
+    """ADMIN: minta layanan kontrol Edge (proses Python di Jetson) me-restart
+    dirinya sendiri (os.execv). Bukan reboot OS. Berguna memulihkan sensor
+    kamera / port serial yang macet tanpa SSH."""
+    if motor_driver.jetson_websocket is None:
+        raise HTTPException(status_code=409, detail="Jetson sedang offline — tidak ada yang bisa di-restart.")
+    await publish_hardware_command({"action": "RESTART_EDGE"})
+    return {"status": "SUCCESS", "action": "RESTART_EDGE",
+            "message": "Perintah restart dikirim. Edge akan terputus ±3-10 detik lalu tersambung lagi."}
+
+
+@router.post("/camera/settings")
+async def apply_camera_settings(payload: CameraSettingsPayload, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    if not hardware_bus_enabled:
+        raise HTTPException(status_code=503, detail="Hardware bus sedang nonaktif.")
+    ensure_pilot(user)
+
+    save_setting(db, "exposure", str(payload.iso))
+    if payload.shutter_speed is not None:
+        save_setting(db, "shutter_speed", str(payload.shutter_speed))
+
+    await publish_hardware_command({
+        "action": "APPLY_CAMERA_SETTINGS",
+        "shutter_speed": payload.shutter_speed,
+        "iso": payload.iso,
+    })
+    return {"status": "SUCCESS", "message": "Pengaturan kamera diterima dan disimpan."}
+
+
+@router.post("/camera/flatfield", dependencies=[Depends(require_admin)])
+async def calibrate_flatfield(mode: str = Query(..., pattern="^(flat|dark)$")):
+    """ADMIN: ambil referensi flat-field di Edge. mode=flat: slide kosong, LED menyala;
+    mode=dark: LED mati. Koreksi tetap nonaktif sampai FLATFIELD_ENABLED=1 di Jetson."""
+    if motor_driver.jetson_websocket is None:
+        raise HTTPException(status_code=409, detail="Jetson sedang offline.")
+    await publish_hardware_command({"action": "CALIBRATE_FLATFIELD", "mode": mode})
+    return {"status": "SUCCESS", "action": "CALIBRATE_FLATFIELD", "mode": mode}
+
+
+# Nilai bawaan tunggal untuk web (Live Stream dan Admin Control) dan Jetson.
+CNC_DEFAULTS = {"feed_rate": 250.0, "backlash": 0.05, "acceleration": 10.0, "settle_time": 500}
+CAMERA_DEFAULTS = {"shutter_speed": 15000, "iso": 200}
+_CNC_KEYS = {"feed_rate": "feedRate", "backlash": "backlash", "acceleration": "acceleration", "settle_time": "settle_time"}
+
+
+def _current_cnc(db: Session) -> dict:
+    cur = {}
+    for field, key in _CNC_KEYS.items():
+        row = db.query(models.SystemSetting).filter_by(key=key).first()
+        try:
+            cur[field] = (int if field == "settle_time" else float)(float(row.value)) if row and row.value else CNC_DEFAULTS[field]
+        except (TypeError, ValueError):
+            cur[field] = CNC_DEFAULTS[field]
+    return cur
+
+
+async def _push_cnc(values: dict) -> None:
+    await publish_hardware_command({"action": "APPLY_CNC_SETTINGS", **values})
+
+
+@router.post("/cnc/settings", dependencies=[Depends(require_admin)])
+async def apply_cnc_settings(payload: CncSettingsPayload, db: Session = Depends(get_db)):
+    if not hardware_bus_enabled:
+        raise HTTPException(status_code=503, detail="Hardware bus sedang nonaktif.")
+    values = _current_cnc(db)
+    for field, v in payload.dict(exclude_none=True).items():
+        values[field] = v
+    for field, key in _CNC_KEYS.items():
+        save_setting(db, key, str(values[field]))
+    await _push_cnc(values)
+    return {"status": "SUCCESS", "message": "Pengaturan CNC diterima dan disimpan.", "applied": values}
+
+
+@router.post("/cnc/soft-limits", dependencies=[Depends(require_admin)])
+async def apply_soft_limits(payload: SoftLimitsPayload, db: Session = Depends(get_db)):
+    """Kirim batas gerak (soft limit switch) ke Jetson. Jetson akan memotong
+    setiap gerak jog/absolut agar tidak melewati batas."""
+    if not hardware_bus_enabled:
+        raise HTTPException(status_code=503, detail="Hardware bus sedang nonaktif.")
+
+    d = payload.dict()
+    save_setting(db, "softLimitsEnabled", "1" if payload.enabled else "0")
+    for k in ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max"):
+        save_setting(db, "softLimit_" + k, "" if d[k] is None else str(d[k]))
+
+    await publish_hardware_command({
+        "action": "APPLY_SOFT_LIMITS",
+        "enabled": payload.enabled,
+        "limits": {
+            "X": [payload.x_min, payload.x_max],
+            "Y": [payload.y_min, payload.y_max],
+            "Z": [payload.z_min, payload.z_max],
+        },
+    })
+    return {"status": "SUCCESS", "message": "Soft limit diterapkan ke Edge."}
+
+# ── State grid scan async (tahan ratusan gambar tanpa kena timeout proxy) ──
+_scan_state = {
+    "running": False, "index": 0, "total": 0,
+    "images": [], "error": None, "started_at": None, "cancel": False,
+    "session": None, "owner": None,
+}
+_scan_task = None  # simpan referensi agar task tidak di-GC di tengah jalan
+
+# ── State tile stitching (dipakai untuk resume setelah refresh & polling) ──
+# Diperbarui dari /stitch (mulai) dan dari event WebSocket Edge (progres/selesai/gagal).
+_stitch_state = {
+    "running": False, "pct": 0, "phase": "", "model": None, "session": None, "owner": None,
+    "error": None, "done": False, "started_at": None, "updated_at": None,
+}
+
+
+def _stitch_reset(model=None, session=None, owner=None):
+    _stitch_state.update({
+        "running": True, "pct": 3, "phase": "Menyiapkan tile", "model": model,
+        "session": session, "owner": owner, "error": None, "done": False,
+        "started_at": time.time(), "updated_at": time.time(),
+    })
+
+
+def _stitch_finish(ok: bool, detail: str = ""):
+    _stitch_state.update({
+        "running": False, "done": ok, "updated_at": time.time(),
+        "pct": 100 if ok else _stitch_state.get("pct", 0),
+        "phase": "Selesai" if ok else "Gagal",
+        "error": None if ok else (detail or "Tile stitching gagal di Edge."),
+    })
+
+
+def _tile_name(session_id: str, row: int, col: int) -> str:
+    """Nama file per POSISI GRID (bukan urutan scan) + prefix SESI unik.
+    Prefix sesi memastikan tile dari scan berbeda tidak pernah tercampur di
+    tmp_images; suffix r/c cocok pola SP_LG 'tile_r<row>_c<col>'."""
+    return f"IMG_{session_id}_r{row}_c{col}.jpg"
+
+
+async def _run_grid_scan(payload: GridScanPayload, origin_x: float, origin_y: float, session_id: str,
+                         feed_rate_mm_min: float = DEFAULT_FEED_RATE_MM_MIN,
+                         row_settle_s: float = ROW_CHANGE_SETTLE_S):
+    """Loop scan grid — dijalankan sebagai background task (BUKAN di dalam
+    request HTTP) sehingga durasi berapa pun (mis. 680 gambar = puluhan menit)
+    tidak kena batas 100–120 detik Cloudflare / proxy. Progres dikirim lewat
+    WebSocket (channel Redis 'microscope_scan_progress')."""
+    import math
+    redis = await get_redis_client(REDIS_URL)
+    images = []
+    idx = 0
+    total_tiles = payload.rows * payload.columns
+    feed_rate_mm_per_sec = feed_rate_mm_min / 60.0
+
+    _scan_state.update({"running": True, "index": 0, "total": total_tiles, "captured": 0, "failed": 0,
+                        "images": [], "error": None, "started_at": time.time(),
+                        "cancel": False, "session": session_id})
+    cancelled = False
+    try:
+        await redis.publish("microscope_scan_progress", json.dumps({
+            "event": "SCAN_STARTED", "total": total_tiles, "session": session_id
+        }))
+
+        # Kunci mode ABSOLUT + gerak ke posisi awal (image ke-1 diambil tepat
+        # di posisi motor sekarang).
+        await redis.publish("hardware_commands", json.dumps({"action": "MOVE_MOTOR", "gcode": "G90"}))
+        await asyncio.sleep(0.05)
+        await redis.publish("hardware_commands", json.dumps({
+            "action": "MOVE_MOTOR", "gcode": f"G1 X{origin_x:.3f} Y{origin_y:.3f} F{feed_rate_mm_min}"
+        }))
+        last_x, last_y = origin_x, origin_y
+
+        tiles = plan_serpentine(payload.rows, payload.columns, origin_x, origin_y, payload.step_x, payload.step_y)
+        for tile in tiles:
+            if _scan_state["cancel"]:
+                cancelled = True
+                break
+            coord_x, coord_y = tile["x"], tile["y"]
+            grid_r, grid_c = tile["grid_row"], tile["grid_col"]
+            filename = _tile_name(session_id, grid_r, grid_c)
+
+            dx = coord_x - last_x
+            dy = coord_y - last_y
+            if dx != 0.0 or dy != 0.0:
+                await redis.publish("hardware_commands", json.dumps({
+                    "action": "MOVE_MOTOR",
+                    "gcode": f"G1 X{coord_x:.3f} Y{coord_y:.3f} F{feed_rate_mm_min}"
+                }))
+
+            distance = math.sqrt(dx**2 + dy**2)
+            last_x, last_y = coord_x, coord_y
+
+            await asyncio.sleep(compute_delay(
+                distance, feed_rate_mm_per_sec, payload.delay_ms, tile["row_change"], row_settle_s))
+
+            file_path = os.path.join(UPLOAD_DIR, filename)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+            await redis.publish("hardware_commands", json.dumps({
+                "action": "CAPTURE_IMAGE", "filename": filename,
+                "session": session_id, "grid_x": grid_c, "grid_y": grid_r,
+            }))
+
+            # Tunggu gambar asli dari Edge tiba (IMAGE_CAPTURED -> ditulis ke
+            # UPLOAD_DIR oleh WS handler). Beri tenggang beberapa detik: pada
+            # grid besar / koneksi lambat, encode+kirim+decode bisa > 1 dtk.
+            edge_online = motor_driver.jetson_websocket is not None
+            grace = 6.0 if edge_online else 0.8
+            waited = 0.0
+            file_path = os.path.join(UPLOAD_DIR, filename)
+            while not os.path.exists(file_path) and waited < grace:
+                await asyncio.sleep(0.3)
+                waited += 0.3
+
+            # Tidak ada gambar pengganti. Tile yang tak tiba dibiarkan kosong; user bisa
+            # "Retake" dari modal review.
+            if not os.path.exists(file_path):
+                print(f"[SCAN GRID] Tile {filename} belum tiba dari Edge setelah {grace:.0f}s — "
+                      f"dibiarkan kosong (bisa di-Retake).")
+
+            # filename=None kalau tile tak pernah tiba (Edge online tapi gagal)
+            # -> modal review menampilkannya sebagai slot kosong + tombol Retake,
+            # bukan gambar rusak / palsu.
+            tile_ok = os.path.exists(file_path)
+            images.append({
+                "index": idx, "filename": filename if tile_ok else None,
+                "coordX": round(coord_x, 2), "coordY": round(coord_y, 2),
+                "gridX": grid_c, "gridY": grid_r,
+            })
+            idx += 1
+            _scan_state["index"] = idx
+            _scan_state["images"] = images
+            _scan_state["captured" if tile_ok else "failed"] += 1
+
+            await redis.publish("microscope_scan_progress", json.dumps({
+                "event": "SCAN_PROGRESS", "index": idx, "total": total_tiles,
+                "filename": filename, "coordX": round(coord_x, 2), "coordY": round(coord_y, 2),
+                "ok": tile_ok, "captured": _scan_state["captured"], "failed": _scan_state["failed"],
+            }))
+
+        _scan_state["running"] = False
+        if cancelled:
+            await redis.publish("microscope_scan_progress", json.dumps({
+                "event": "SCAN_CANCELLED", "total": len(images), "images": images, "session": session_id
+            }))
+            print(f"[SCAN GRID] Dibatalkan setelah {len(images)} gambar.")
+        else:
+            await redis.publish("microscope_scan_progress", json.dumps({
+                "event": "SCAN_COMPLETE", "total": len(images), "images": images, "session": session_id
+            }))
+            print(f"[SCAN GRID] Selesai: {len(images)} gambar (sesi {session_id}).")
+    except Exception as exc:
+        _scan_state["running"] = False
+        _scan_state["error"] = str(exc)
+        print(f"[SCAN GRID ERROR] {exc}")
+        try:
+            await redis.publish("microscope_scan_progress", json.dumps({
+                "event": "SCAN_FAILED", "detail": str(exc)
+            }))
+        except Exception:
+            pass
+    finally:
+        try:
+            await redis.publish("hardware_commands", json.dumps({"action": "MOVE_MOTOR", "gcode": "G90"}))
+        except Exception:
+            pass
+        await redis.close()
+
+
+@router.post("/scan/grid")
+async def scan_grid(payload: GridScanPayload, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    if not hardware_bus_enabled:
+        raise HTTPException(status_code=503, detail="Hardware bus sedang nonaktif.")
+    ensure_pilot(user)
+    if _scan_state["running"]:
+        raise HTTPException(status_code=409, detail="Sebuah grid scan masih berjalan. Tunggu sampai selesai.")
+    _scan_state["cancel"] = False
+
+    from datetime import datetime
+    # ID sesi unik: 1 scan = 1 folder tmp_images/<session> di Edge, tidak
+    # pernah tercampur dengan scan lain.
+    session_id = datetime.now().strftime("%Y%m%d%H%M%S") + "_" + uuid.uuid4().hex[:6]
+
+    # ── Titik awal grid = POSISI MOTOR SAAT INI (bukan 0,0) ──
+    if motor_driver.jetson_websocket is not None:
+        ensure_cnc_online()
+        waited = 0.0
+        while motor_driver.last_edge_position is None and waited < 3.0:
+            await asyncio.sleep(0.2)
+            waited += 0.2
+        if motor_driver.last_edge_position is None:
+            raise HTTPException(status_code=409,
+                detail="Posisi motor belum diketahui dari telemetri Edge. "
+                       "Gerakkan motor sedikit atau tunggu beberapa detik lalu ulangi.")
+        origin_x = motor_driver.last_edge_position["X"]
+        origin_y = motor_driver.last_edge_position["Y"]
+        print(f"[SCAN GRID] Titik awal = posisi motor saat ini: X{origin_x:.3f} Y{origin_y:.3f}")
+    else:
+        origin_x, origin_y = payload.start_x, payload.start_y
+        print(f"[SCAN GRID] Edge offline, titik awal dari frontend: X{origin_x} Y{origin_y}")
+
+    total_tiles = payload.rows * payload.columns
+
+    # Rencana lengkap (filename + koordinat) supaya frontend tahu daftar penuh
+    # tanpa menunggu scan selesai. Urutan idx = urutan loop (r luar, c dalam),
+    # jadi nama file cocok persis dengan yang dibuat _run_grid_scan.
+    planned = [{
+        "index": idx,
+        "filename": _tile_name(session_id, t["grid_row"], t["grid_col"]),
+        "coordX": round(t["x"], 2), "coordY": round(t["y"], 2),
+        "gridX": t["grid_col"], "gridY": t["grid_row"],
+    } for idx, t in enumerate(
+        plan_serpentine(payload.rows, payload.columns, origin_x, origin_y, payload.step_x, payload.step_y))]
+
+    feed_rate = _setting_float(db, "feedRate", DEFAULT_FEED_RATE_MM_MIN)
+    row_settle = _setting_float(db, "rowChangeSettleS", ROW_CHANGE_SETTLE_S, minimum=0.0)
+
+    # Jalankan sebagai background task -> HTTP balas < 1 detik.
+    global _scan_task
+    # Pemilik scan: pengguna lain yang membuka tab hanya menonton dan tidak bisa membatalkan.
+    _scan_state["owner"] = user.username
+    _scan_task = asyncio.create_task(_run_grid_scan(payload, origin_x, origin_y, session_id, feed_rate, row_settle))
+
+    return {"status": "STARTED", "total": total_tiles, "images": planned, "session": session_id}
+
+
+@router.get("/scan/status", dependencies=[Depends(get_current_user)])
+async def scan_status():
+    """Polling untuk memulihkan progres kalau WebSocket sempat putus."""
+    return {
+        "running": _scan_state["running"],
+        "index": _scan_state["index"],
+        "total": _scan_state["total"],
+        "captured": _scan_state.get("captured", 0),
+        "failed": _scan_state.get("failed", 0),
+        "error": _scan_state["error"],
+        "images": _scan_state["images"],
+        "cancelled": _scan_state["cancel"],
+        "session": _scan_state["session"],
+        "owner": _scan_state.get("owner"),
+    }
+
+
+@router.post("/scan/cancel")
+async def scan_cancel(user: models.User = Depends(get_current_user)):
+    """Batalkan grid scan yang sedang berjalan. Loop akan berhenti di tile
+    berikutnya lalu mengirim event SCAN_CANCELLED. Hanya pemilik scan, Pilot
+    saat ini, atau Admin yang boleh membatalkan."""
+    if not _scan_state["running"]:
+        return {"status": "IDLE", "message": "Tidak ada scan yang berjalan."}
+    is_admin = (user.role or "").upper() == "ADMIN"
+    pilot = room_manager.pilot
+    is_pilot = pilot is not None and pilot["username"] == user.username
+    if not (is_admin or is_pilot or _scan_state.get("owner") == user.username):
+        raise HTTPException(status_code=403,
+                            detail="Scan ini dijalankan pengguna lain. Hanya pemilik scan, Pilot, atau Admin yang bisa membatalkan.")
+    _scan_state["cancel"] = True
+    return {"status": "CANCELLING"}
+
+
+@router.delete("/scan/session/{session_id}")
+async def delete_scan_session(session_id: str, user: models.User = Depends(get_current_user)):
+    """Hapus berkas kerja satu sesi scan di VPS dan Jetson, atas permintaan pengguna.
+    Dataset yang sudah disimpan adalah salinan terpisah, jadi tidak ikut terhapus."""
+    ensure_pilot(user)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id):
+        raise HTTPException(status_code=400, detail="ID sesi tidak valid.")
+    if _scan_state["running"] and _scan_state.get("session") == session_id:
+        raise HTTPException(status_code=409, detail="Sesi ini masih berjalan. Batalkan scan dulu.")
+    deleted = 0
+    for path in glob.glob(os.path.join(glob.escape(UPLOAD_DIR), f"IMG_{session_id}_r*_c*.jpg")):
+        os.remove(path)
+        deleted += 1
+    await publish_hardware_command({"action": "PURGE_SESSION", "session": session_id})
+    return {"status": "SUCCESS", "deleted": deleted}
+
+
+@router.post("/scan/retake")
+async def retake_grid_image(payload: RetakePayload, user: models.User = Depends(get_current_user)):
+    if not hardware_bus_enabled:
+        raise HTTPException(status_code=503, detail="Hardware bus sedang nonaktif.")
+    ensure_pilot(user)  # retake juga menggerakkan motor
+
+    safe_name(payload.filename)
+    if motor_driver.jetson_websocket is None:
+        raise HTTPException(status_code=504, detail="Edge tidak merespons, citra tidak diambil")
+    redis = await get_redis_client(REDIS_URL)
+    logger.debug("Retake: motor_driver id=%s jetson=%s", id(motor_driver), motor_driver.jetson_websocket)
+    try:
+        # 1. Gerakkan motor ke koordinat Retake — TANPA absolute move ke koordinat
+        #    mentah (bisa jadi 0,0 dan bikin CNC "homing"). Kalau posisi live Edge
+        #    diketahui, hitung delta lalu gerak RELATIF; kalau tidak, jepret di
+        #    tempat (user biasanya sudah memposisikan head secara manual).
+        edge_pos = motor_driver.last_edge_position
+        if edge_pos is not None:
+            ddx = payload.coord_x - edge_pos["X"]
+            ddy = payload.coord_y - edge_pos["Y"]
+            if abs(ddx) > 1e-4 or abs(ddy) > 1e-4:
+                await redis.publish("hardware_commands", json.dumps({"action": "MOVE_MOTOR", "gcode": "G91"}))
+                await asyncio.sleep(0.05)
+                await redis.publish("hardware_commands", json.dumps({
+                    "action": "MOVE_MOTOR",
+                    "gcode": f"G1 X{ddx:.3f} Y{ddy:.3f} F250.0"
+                }))
+                await asyncio.sleep(0.05)
+                await redis.publish("hardware_commands", json.dumps({"action": "MOVE_MOTOR", "gcode": "G90"}))
+        else:
+            print("[RETAKE] Posisi live Edge tidak diketahui — memotret di posisi saat ini tanpa menggerakkan motor.")
+
+        # 2. Tunggu stabilitas mekanik
+        await asyncio.sleep(2.5 + (payload.delay_ms / 1000.0))
+
+        # File lama sengaja TIDAK dihapus dulu: kalau Edge gagal, tile lama masih bisa
+        # dipakai. Citra baru dikenali dari waktu modifikasinya.
+        file_path = safe_join(UPLOAD_DIR, payload.filename)
+        old_mtime = os.path.getmtime(file_path) if os.path.exists(file_path) else None
+
+        # 3. Jepret. Kalau ini retake tile GRID (ada session + posisi grid), kirim
+        #    metadata itu supaya Edge menimpa tile di folder sesi terisolasi
+        #    (tmp_images/<session>/tile_r<gy>_c<gx>.jpg), bukan sekadar file flat.
+        capture_cmd = {"action": "CAPTURE_IMAGE", "filename": payload.filename}
+        if payload.session and payload.grid_x is not None and payload.grid_y is not None:
+            capture_cmd["session"] = payload.session
+            capture_cmd["grid_x"] = payload.grid_x
+            capture_cmd["grid_y"] = payload.grid_y
+        await redis.publish("hardware_commands", json.dumps(capture_cmd))
+
+        # 4. Tunggu citra asli dari Edge (IMAGE_CAPTURED -> ditulis ke UPLOAD_DIR oleh WS
+        #    handler). Tidak ada gambar pengganti: kalau tidak tiba, laporkan kegagalan.
+        waited = 0.0
+        while waited < RETAKE_TIMEOUT_S:
+            if os.path.exists(file_path) and os.path.getmtime(file_path) != old_mtime:
+                return {"status": "SUCCESS", "filename": payload.filename}
+            await asyncio.sleep(0.2)
+            waited += 0.2
+    finally:
+        await redis.close()
+
+    raise HTTPException(status_code=504, detail="Edge tidak merespons, citra tidak diambil")
+
+STITCH_OUTPUT = "stitched_ta_output.jpg"
+
+
+@router.post("/stitch")
+async def stitch_images(payload: StitchPayload, user: models.User = Depends(get_current_user)):
+    """Mulai tile stitching di Edge. ASINKRON: balas cepat, hasil dilaporkan
+    lewat WebSocket (event STITCH_COMPLETE / STITCH_FAILED) — sama seperti grid
+    scan, supaya tidak kena batas waktu proxy untuk mosaik besar."""
+    if not hardware_bus_enabled:
+        raise HTTPException(status_code=503, detail="Hardware bus sedang nonaktif.")
+
+    model = (payload.model or "sp_lg_tensorrt").lower()
+    if model not in STITCH_MODELS:
+        model = "sp_lg_tensorrt"
+
+    output_path = os.path.join(UPLOAD_DIR, STITCH_OUTPUT)
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    # Lengkapi tiap tile dengan URL publik agar Edge bisa mengunduh gambar yang
+    # tidak ada di memori lokalnya (mis. mode "Input Images" dari database/upload).
+    tiles = payload.tiles
+    for name in payload.images or []:
+        safe_name(name)
+    if tiles:
+        for t in tiles:
+            fn = t.get("filename")
+            if fn:
+                safe_name(fn)
+            if fn and not t.get("url"):
+                t["url"] = f"/static/uploads/{fn}"
+
+    _stitch_reset(model, payload.session, owner=user.username)
+
+    redis = await get_redis_client(REDIS_URL)
+    try:
+        await redis.publish("hardware_commands", json.dumps({
+            "action": "START_STITCHING",
+            "images": payload.images,
+            "tiles": tiles,
+            "model": model,
+            "session": payload.session,
+        }))
+    finally:
+        await redis.close()
+
+    return {"status": "STARTED", "model": model, "session": payload.session}
+
+
+@router.get("/stitch/status", dependencies=[Depends(get_current_user)])
+async def stitch_status():
+    """Status tile stitching untuk polling & resume setelah refresh halaman.
+    `running` menandai proses masih jalan; `done` sukses; `error` bila gagal.
+    `output_exists` cadangan bila event WebSocket selesai terlewat total."""
+    output_path = os.path.join(UPLOAD_DIR, STITCH_OUTPUT)
+    output_exists = os.path.exists(output_path)
+    st = dict(_stitch_state)
+    st["output_exists"] = output_exists
+    st["filename"] = STITCH_OUTPUT
+    # Kompat: field lama `done` sebelumnya = "file hasil ada".
+    if not st["running"] and output_exists and not st["error"]:
+        st["done"] = True
+    return st
+
+
+@router.post("/stitch/place", dependencies=[Depends(get_current_user)])
+async def stitch_place_upload(
+    file: UploadFile = File(...),
+    grid_x: int = Form(...),
+    grid_y: int = Form(...),
+    session: str = Form("input"),
+):
+    """Mode 'Input Images': taruh satu gambar dari PERANGKAT user ke sel grid
+    (grid_x, grid_y). Nama file otomatis mengikuti posisi grid."""
+    safe_session = "".join(ch for ch in session if ch.isalnum() or ch in "-_")[:24] or "input"
+    filename = f"IMG_{safe_session.upper()}_r{grid_y}_c{grid_x}.jpg"
+    dst = os.path.join(UPLOAD_DIR, filename)
+    with open(dst, "wb") as buf:
+        shutil.copyfileobj(file.file, buf)
+    return {"filename": filename, "url": f"/static/uploads/{filename}", "gridX": grid_x, "gridY": grid_y}
+
+
+@router.post("/stitch/place-from-dataset", dependencies=[Depends(get_current_user)])
+async def stitch_place_from_dataset(payload: InputTileFromDataset):
+    """Mode 'Input Images': taruh satu gambar dari DATABASE (dataset folder) ke
+    sel grid. Disalin ke uploads dengan nama sesuai posisi grid."""
+    src = safe_join(DATASET_DIR, payload.folder_id, payload.image_name)
+    if not os.path.exists(src):
+        raise HTTPException(status_code=404, detail="Gambar dataset tidak ditemukan.")
+    safe_session = "".join(ch for ch in (payload.session or "INPUT") if ch.isalnum() or ch in "-_")[:24] or "INPUT"
+    filename = f"IMG_{safe_session.upper()}_r{payload.grid_y}_c{payload.grid_x}.jpg"
+    dst = os.path.join(UPLOAD_DIR, filename)
+    shutil.copy2(src, dst)
+    return {"filename": filename, "url": f"/static/uploads/{filename}",
+            "gridX": payload.grid_x, "gridY": payload.grid_y}
+
+
+_GRIDPOS_RE = re.compile(r"_r(\d+)_c(\d+)", re.IGNORECASE)
+
+
+@router.post("/stitch/place-folder", dependencies=[Depends(get_current_user)])
+def stitch_place_folder(payload: PlaceFolderPayload):
+    """Mode 'Input Images': isi SELURUH grid sekaligus dari satu folder dataset.
+    Sistem mengenali posisi tiap gambar:
+      - jika nama berkas memuat pola '..._r<baris>_c<kolom>...' -> dipakai apa adanya;
+      - selain itu diisi berurutan (row-major / serpentine) menurut nama file terurut.
+    Tiap gambar disalin ke uploads dengan nama sesuai posisi grid, siap di-stitch."""
+    folder_dir = safe_join(DATASET_DIR, payload.folder_id)
+    if not os.path.isdir(folder_dir):
+        raise HTTPException(status_code=404, detail="Folder dataset tidak ditemukan.")
+
+    rows, cols = max(1, payload.rows), max(1, payload.columns)
+    imgs = sorted(
+        f for f in os.listdir(folder_dir)
+        if f.lower().endswith((".png", ".jpg", ".jpeg")) and not f.startswith("_temp_")
+        and os.path.isfile(os.path.join(folder_dir, f))
+    )
+    if not imgs:
+        raise HTTPException(status_code=400, detail="Folder ini tidak berisi gambar.")
+
+    safe_session = "".join(ch for ch in (payload.session or "INPUT") if ch.isalnum() or ch in "-_")[:24] or "INPUT"
+    safe_session = safe_session.upper()
+
+    # 1) Coba kenali dari nama berkas.
+    by_name = {}
+    for f in imgs:
+        m = _GRIDPOS_RE.search(f)
+        if m:
+            gy, gx = int(m.group(1)), int(m.group(2))
+            if 0 <= gy < rows and 0 <= gx < cols and (gy, gx) not in by_name:
+                by_name[(gy, gx)] = f
+
+    tiles = []
+    used = set()
+    if len(by_name) >= 2:
+        for (gy, gx), f in by_name.items():
+            fname = f"IMG_{safe_session}_r{gy}_c{gx}.jpg"
+            shutil.copy2(os.path.join(folder_dir, f), os.path.join(UPLOAD_DIR, fname))
+            tiles.append({"filename": fname, "url": f"/static/uploads/{fname}",
+                          "gridX": gx, "gridY": gy, "source": f})
+            used.add(f)
+        matched_by_name = True
+    else:
+        # 2) Isi berurutan.
+        matched_by_name = False
+        remaining = [f for f in imgs if f not in used][: rows * cols]
+        for idx, f in enumerate(remaining):
+            gy = idx // cols
+            actual_x = idx % cols
+            if payload.order == "serpentine" and gy % 2 == 1:
+                actual_x = cols - 1 - actual_x
+            fname = f"IMG_{safe_session}_r{gy}_c{actual_x}.jpg"
+            shutil.copy2(os.path.join(folder_dir, f), os.path.join(UPLOAD_DIR, fname))
+            tiles.append({"filename": fname, "url": f"/static/uploads/{fname}",
+                          "gridX": actual_x, "gridY": gy, "source": f})
+
+    return {
+        "status": "OK", "session": safe_session, "count": len(tiles),
+        "total_in_folder": len(imgs), "recognized_from_name": matched_by_name,
+        "rows": rows, "columns": cols, "tiles": tiles,
+    }
+
+
+@router.post("/bus/toggle", dependencies=[Depends(require_admin)])
+async def toggle_hardware_bus(payload: HardwareBusTogglePayload):
+    global hardware_bus_enabled
+    hardware_bus_enabled = payload.enabled
+
+    if not hardware_bus_enabled:
+        await publish_hardware_command({"action": "STOP_STREAM"})
+
+    return {"status": "SUCCESS", "enabled": hardware_bus_enabled}
+
+
+# ====================================================================
+# 2. PIPA WEBSOCKET UTAMA: JEMBATAN ANTARA VPS CLOUD & JETSON EDGE
+# ====================================================================
+@router.websocket("/ws")
+async def hardware_websocket_endpoint(websocket: WebSocket, device_token: str = Query(None)):
+    await websocket.accept()
+
+    # Accept dulu supaya Jetson bisa membaca kode 4003 dan tidak reconnect cepat.
+    if not edge_token_valid(device_token) and edge_token_required():
+        print("[VPS ROUTER] Koneksi Edge ditolak: device token tidak valid.", flush=True)
+        await websocket.close(code=4003)
+        return
+
+    logger.debug("Membuka koneksi Edge, redis=%s", REDIS_URL)
+    redis = await get_redis_client(REDIS_URL)
+    motor_driver.register_jetson(websocket)
+    logger.debug("motor_driver id=%s jetson=%s", id(motor_driver), motor_driver.jetson_websocket)
+    print("[VPS ROUTER] Sirkuit pipa WebSocket Jetson Orin Nano Berhasil Dibuka.", flush=True)
+
+    # Simpan task agar bisa dibatalkan secara bersih saat disconnect
+    listener_task = None
+    
+    async def redis_listener():
+        logger.debug("Listener redis Edge dimulai")
+        pubsub = redis.pubsub()
+        await pubsub.subscribe("hardware_commands")
+        try:
+            async for message in pubsub.listen():
+                if message.get('type') == 'message':
+                    command_payload = message['data'].decode('utf-8')
+                    await websocket.send_text(command_payload)
+        except asyncio.CancelledError:
+            print("[VPS REDIS] Listener dibatalkan secara bersih.")
+        except Exception as e:
+            print(f"[VPS REDIS LISTENER ERROR] Terjadi interupsi channel: {e}")
+        finally:
+            await pubsub.unsubscribe("hardware_commands")
+            await pubsub.close()
+
+    async def edge_heartbeat():
+        # Sumber "pesan masuk" untuk watchdog Jetson. Tanpa ini Jetson tidak bisa
+        # membedakan link putus dengan VPS yang memang sedang tidak punya perintah.
+        try:
+            while True:
+                await asyncio.sleep(EDGE_HEARTBEAT_INTERVAL_S)
+                await websocket.send_text(json.dumps({"action": "PING"}))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[VPS HEARTBEAT] Berhenti: {e}")
+
+    # Jalankan task dan simpan referensinya
+    listener_task = asyncio.create_task(redis_listener())
+    heartbeat_task = asyncio.create_task(edge_heartbeat())
+    
+    try:
+        while True:
+            message = await websocket.receive_text()
+            data = json.loads(message)
+            event_type = data.get("event")
+            
+            if event_type == "STREAM_DATA":
+                raw_base64 = data.get("image")
+                if raw_base64:
+                    camera_driver.update_frame(raw_base64)
+                    await redis.publish("microscope_video_stream", message)
+                
+            elif event_type == "TELEMETRY_DATA":
+                last_edge_telemetry.clear()
+                last_edge_telemetry.update(data)
+                # Simpan posisi fisik terakhir Jetson untuk dipakai sebagai titik
+                # awal grid scan (mencegah CNC balik ke origin / terlihat homing).
+                pos = data.get("position")
+                if isinstance(pos, dict):
+                    try:
+                        motor_driver.last_edge_position = {
+                            "X": float(pos.get("X", 0.0)),
+                            "Y": float(pos.get("Y", 0.0)),
+                            "Z": float(pos.get("Z", 0.0)),
+                        }
+                    except (TypeError, ValueError):
+                        pass
+                await redis.publish("microscope_telemetry", message)
+                
+            elif event_type == "MOTOR_MOVED":
+                print(f"[VPS ROUTER FEEDBACK] Respon balik GRBL: {data.get('grbl_response')}")
+                await redis.publish("microscope_motor_feedback", message)
+                
+            elif event_type in ["IMAGE_CAPTURED", "STITCHING_COMPLETE", "COUNTING_COMPLETE", "EDIT_COMPLETE", "CV_RESULT"]:
+                # Nama dari Edge tetap disaring: tidak boleh menulis di luar UPLOAD_DIR.
+                filename = os.path.basename(str(data.get("filename", "output.jpg"))) or "output.jpg"
+                img_b64_data = data.get("image_data", "")
+
+                if img_b64_data and "," in img_b64_data:
+                    header, base64_str = img_b64_data.split(",", 1)
+                    try:
+                        image_bytes = base64.b64decode(base64_str)
+                        file_path = os.path.join(UPLOAD_DIR, filename)
+
+                        # Hasil Image Analysis (CV_RESULT): tulis sidecar .json yang
+                        # dibaca analysis.py (colony_count / luas / stats morfologi).
+                        # Ditulis SEBELUM gambar utama: GET /analysis/status
+                        # menganggap selesai begitu gambar utama ada.
+                        if event_type == "CV_RESULT":
+                            cv_bus.clear(filename)
+                            json_path = os.path.splitext(file_path)[0] + ".json"
+                            sidecar = None
+                            if data.get("colonies") is not None:
+                                sidecar = {"colony_count": data["colonies"]}
+                            elif isinstance(data.get("stats"), dict):
+                                sidecar = dict(data["stats"])
+                            if sidecar is not None:
+                                # Luas koloni YOLO (colony-count & morfologi): histogram + CSV.
+                                if isinstance(data.get("area"), dict):
+                                    sidecar["area"] = data["area"]
+                                    sidecar.update(_save_area_exports(data))
+                                with open(json_path, "w") as jf:
+                                    json.dump(sidecar, jf)
+
+                        with open(file_path, "wb") as f:
+                            f.write(image_bytes)
+                        print(f"[VPS STORAGE SUCCESS] Berhasil menulis hasil AI ke disk: {file_path}", flush=True)
+
+                        await redis.publish("microscope_analysis_result", message)
+                    except Exception as err:
+                        print(f"[VPS STORAGE ERROR] Gagal mendecode gambar Base64: {err}")
+
+                if event_type == "STITCHING_COMPLETE":
+                    _stitch_finish(True)
+                    await redis.publish("microscope_scan_progress", json.dumps({
+                        "event": "STITCH_COMPLETE", "filename": filename
+                    }))
+
+            elif event_type in ["STITCHING_FAILED", "COUNTING_FAILED", "EDIT_FAILED", "CV_FAILED"]:
+                _detail = data.get("detail", "Proses AI gagal di Edge Device.")
+                if event_type == "CV_FAILED":
+                    cv_bus.mark_failed(data.get("output_name"), _detail)
+                    await redis.publish("microscope_analysis_result", json.dumps({
+                        "event": "CV_FAILED", "tool": data.get("tool"), "detail": _detail
+                    }))
+                else:
+                    _stitch_finish(False, _detail)
+                    await redis.publish("microscope_scan_progress", json.dumps({
+                        "event": "STITCH_FAILED", "detail": _detail
+                    }))
+
+            elif event_type == "STITCH_PROGRESS":
+                # Rekam progres untuk polling / resume, lalu teruskan ke browser.
+                try:
+                    if isinstance(data.get("pct"), (int, float)):
+                        _stitch_state["pct"] = max(_stitch_state.get("pct", 0), int(data["pct"]))
+                    if data.get("phase"):
+                        _stitch_state["phase"] = str(data["phase"])
+                    _stitch_state["running"] = True
+                    _stitch_state["updated_at"] = time.time()
+                except Exception:
+                    pass
+                await redis.publish("microscope_scan_progress", message)
+
+            elif event_type == "EDGE_RESTARTING":
+                if _stitch_state["running"]:
+                    _stitch_finish(False, "Layanan Edge di-restart saat stitching berjalan.")
+                    await redis.publish("microscope_scan_progress", json.dumps({
+                        "event": "STITCH_FAILED", "detail": _stitch_state["error"]
+                    }))
+                
+    except WebSocketDisconnect:
+        print("[VPS ROUTER WARNING] Koneksi Jetson Orin Nano terputus dari sirkuit cloud.")
+    finally:
+        if listener_task and not listener_task.done():
+            listener_task.cancel()
+            try:
+                await listener_task
+            except asyncio.CancelledError:
+                pass
+        heartbeat_task.cancel()
+
+        # Jetson menahan motor (feed hold) saat link putus. Scan jangan diteruskan saat
+        # Jetson tersambung lagi: operator yang memutuskan kapan gerak dimulai kembali.
+        if _scan_state["running"]:
+            _scan_state["cancel"] = True
+
+        # Kalau Jetson putus di tengah stitching, jangan biarkan status "running"
+        # menggantung — beri tahu web supaya berhenti menunggu.
+        if _stitch_state["running"]:
+            _stitch_finish(False, "Koneksi Edge terputus saat tile stitching berjalan.")
+            try:
+                await redis.publish("microscope_scan_progress", json.dumps({
+                    "event": "STITCH_FAILED", "detail": _stitch_state["error"]
+                }))
+            except Exception:
+                pass
+
+        # Jetson bisa reconnect sebelum koneksi lama selesai dibereskan: jangan sampai
+        # koneksi lama menghapus registrasi koneksi yang baru.
+        if motor_driver.jetson_websocket is websocket:
+            last_edge_telemetry.clear()
+            motor_driver.unregister_jetson()
+            camera_driver.stop()
+        try:
+            await redis.publish("microscope_telemetry", json.dumps({
+                "event": "TELEMETRY_DATA",
+                "status": "OFFLINE",
+                "limit_switch": "N/A",
+                "jetson_temp_c": None
+            }))
+        except Exception:
+            pass
+        await redis.close()
+
+
+# Koneksi yang tidak mengirim pesan apa pun (termasuk HEARTBEAT) selama ini dianggap hantu.
+GHOST_TIMEOUT_S = 90
+# Koneksi lama milik pengguna yang sama dianggap sudah mati kalau tidak mengirim apa pun
+# selama ini saat pengguna menyambung ulang (browser mengirim HEARTBEAT tiap 20 detik).
+# Kasus umum: layar HP mati, sistem membekukan halaman, lalu halaman menyambung ulang.
+STALE_RECONNECT_S = 30
+# Pilot tanpa interaksi selama ini diturunkan, hanya kalau ada orang lain yang menunggu.
+PILOT_IDLE_S = 600
+MAX_SPECTATORS = 2
+
+
+class RoomManager:
+    def __init__(self):
+        self.pilot = None # dict: {"ws": websocket, "username": str, "role": str, "last_seen": float, "last_active": float}
+        self.spectators = [] # list of dicts
+        self.queue = [] # list of dicts
+        self.lock = asyncio.Lock()
+        
+    async def get_state_payload(self):
+        return {
+            "event": "ROOM_STATE_UPDATE",
+            "pilot": {"username": self.pilot["username"], "ip": self.pilot.get("ip"), "cid": self.pilot.get("cid")} if self.pilot else None,
+            "spectators": [{"username": s["username"], "ip": s.get("ip"), "cid": s.get("cid")} for s in self.spectators],
+            "queue": [{"username": q["username"], "ip": q.get("ip"), "cid": q.get("cid")} for q in self.queue]
+        }
+        
+    async def broadcast_state(self):
+        payload = json.dumps(await self.get_state_payload())
+        if self.pilot:
+            try:
+                await self.pilot["ws"].send_text(payload)
+            except Exception:
+                pass
+        for s in self.spectators:
+            try:
+                await s["ws"].send_text(payload)
+            except Exception:
+                pass
+        for q in self.queue:
+            try:
+                await q["ws"].send_text(payload)
+            except Exception:
+                pass
+
+    def get_user_connection_count(self, username: str) -> int:
+        count = 0
+        if self.pilot and self.pilot["username"] == username: count += 1
+        count += sum(1 for s in self.spectators if s["username"] == username)
+        count += sum(1 for q in self.queue if q["username"] == username)
+        return count
+
+    @staticmethod
+    def _reset_timers(u: dict) -> None:
+        now = time.time()
+        u["last_seen"] = now
+        u["last_active"] = now
+
+    @staticmethod
+    async def _send_role(u: dict, role: str, reason: str = None) -> None:
+        msg = {"event": "ROLE_ASSIGNED", "role": role}
+        if reason:
+            msg["reason"] = reason
+        try:
+            await u["ws"].send_text(json.dumps(msg))
+        except Exception:
+            pass
+
+    async def _fill_vacancies(self, skip: dict = None, fill_spectators: bool = True) -> None:
+        """Isi kursi kosong: Pilot dari spectator terdepan, kalau tidak ada dari
+        antrean; lalu kursi spectator dari antrean. Setiap promosi me-reset timer,
+        supaya orang yang sudah lama diam tidak langsung diturunkan lagi.
+        `skip` tidak dipromosikan (mis. orang yang baru dipindah admin ke antrean)."""
+        if self.pilot is None:
+            waiting = [q for q in self.queue if q is not skip]
+            if self.spectators:
+                self.pilot = self.spectators.pop(0)
+            elif waiting:
+                self.pilot = waiting[0]
+                self.queue.remove(self.pilot)
+            if self.pilot is not None:
+                self._reset_timers(self.pilot)
+                await self._send_role(self.pilot, "PILOT")
+
+        if fill_spectators:
+            for q in [q for q in self.queue if q is not skip]:
+                if len(self.spectators) >= MAX_SPECTATORS:
+                    break
+                self.queue.remove(q)
+                self.spectators.append(q)
+                self._reset_timers(q)
+                await self._send_role(q, "SPECTATOR")
+
+    async def connect(self, websocket: WebSocket, username: str, role: str):
+        # websocket.accept() sudah dilakukan di client_websocket_endpoint.
+        stale_ws = []
+        async with self.lock:
+            # Lepas koneksi lama pengguna ini yang sudah tidak mengirim heartbeat; kursinya
+            # (termasuk Pilot) diwarisi koneksi baru, dan tidak ikut dihitung batas 3 perangkat.
+            now = time.time()
+            inherit_pilot = False
+            for u in ([self.pilot] if self.pilot else []) + list(self.spectators) + list(self.queue):
+                if u["username"] != username or now - u["last_seen"] <= STALE_RECONNECT_S:
+                    continue
+                stale_ws.append(u["ws"])
+                if u is self.pilot:
+                    self.pilot = None
+                    inherit_pilot = True
+                elif u in self.spectators:
+                    self.spectators.remove(u)
+                else:
+                    self.queue.remove(u)
+
+            if self.get_user_connection_count(username) >= 3:
+                try:
+                    await websocket.send_text(json.dumps({"event": "ROLE_ASSIGNED", "role": "MAX_DEVICES_REACHED"}))
+                    await websocket.close(code=1008)
+                except Exception:
+                    pass
+                return None
+                
+            cid = str(uuid.uuid4())
+            ip = websocket.client.host if websocket.client else "Unknown"
+            user_data = {"ws": websocket, "username": username, "role": role, "ip": ip, "cid": cid}
+            self._reset_timers(user_data)
+            assigned_role = ""
+            
+            if self.pilot is None or inherit_pilot:
+                self.pilot = user_data
+                assigned_role = "PILOT"
+            elif len(self.spectators) < MAX_SPECTATORS:
+                self.spectators.append(user_data)
+                assigned_role = "SPECTATOR"
+            else:
+                self.queue.append(user_data)
+                assigned_role = "QUEUED"
+
+        for old in stale_ws:
+            try:
+                await asyncio.wait_for(old.close(code=1000), 2.0)
+            except Exception:
+                pass
+
+        try:
+            await websocket.send_text(json.dumps({"event": "ROLE_ASSIGNED", "role": assigned_role}))
+        except Exception:
+            pass
+
+        presence.mark_online(username)
+
+        async with self.lock:
+            await self.broadcast_state()
+
+        return user_data
+
+    async def disconnect(self, websocket: WebSocket):
+        gone_username = None
+        async with self.lock:
+            found = False
+            if self.pilot and self.pilot["ws"] == websocket:
+                gone_username = self.pilot["username"]
+                self.pilot = None
+                found = True
+            else:
+                for u in self.spectators:
+                    if u["ws"] == websocket:
+                        gone_username = u["username"]
+                        self.spectators.remove(u)
+                        found = True
+                        break
+                if not found:
+                    for u in self.queue:
+                        if u["ws"] == websocket:
+                            gone_username = u["username"]
+                            self.queue.remove(u)
+                            found = True
+                            break
+
+            if not found:
+                return
+
+            await self._fill_vacancies()
+            await self.broadcast_state()
+
+        # Di luar lock: kalau user ini tak punya koneksi lain -> tandai offline.
+        if gone_username and self.get_user_connection_count(gone_username) == 0:
+            presence.mark_offline(gone_username)
+
+    async def takeover(self, websocket: WebSocket):
+        async with self.lock:
+            admin_user = None
+            if self.pilot and self.pilot["ws"] == websocket:
+                return
+            
+            for u in self.spectators:
+                if u["ws"] == websocket:
+                    admin_user = u
+                    break
+            if not admin_user:
+                for u in self.queue:
+                    if u["ws"] == websocket:
+                        admin_user = u
+                        break
+                        
+            if admin_user and admin_user["role"].upper() == "ADMIN":
+                self.spectators = [u for u in self.spectators if u["ws"] != websocket]
+                self.queue = [u for u in self.queue if u["ws"] != websocket]
+                
+                old_pilot = self.pilot
+                self.pilot = admin_user
+                self._reset_timers(admin_user)
+                await self._send_role(admin_user, "PILOT")
+                
+                if old_pilot:
+                    self._reset_timers(old_pilot)
+                    if len(self.spectators) < MAX_SPECTATORS:
+                        self.spectators.append(old_pilot)
+                        await self._send_role(old_pilot, "SPECTATOR")
+                    else:
+                        self.queue.insert(0, old_pilot)
+                        await self._send_role(old_pilot, "QUEUED")
+
+                await self._fill_vacancies()
+                            
+            await self.broadcast_state()
+
+    async def admin_action(self, cid: str, action: str):
+        target_ws = None
+        target_user = None
+        
+        async with self.lock:
+            if self.pilot and self.pilot.get("cid") == cid:
+                target_user = self.pilot
+            else:
+                for s in self.spectators:
+                    if s.get("cid") == cid:
+                        target_user = s
+                        break
+                if not target_user:
+                    for q in self.queue:
+                        if q.get("cid") == cid:
+                            target_user = q
+                            break
+                            
+            if not target_user:
+                return False
+                
+            target_ws = target_user["ws"]
+
+        if action == "KICK":
+            try:
+                await target_ws.send_text(json.dumps({"event": "ROLE_ASSIGNED", "role": "KICKED_BY_ADMIN"}))
+                await target_ws.close(code=1008)
+            except Exception:
+                pass
+            await self.disconnect(target_ws)
+            return True
+
+        if action not in ("MAKE_PILOT", "MAKE_SPECTATOR", "MAKE_QUEUE", "QUEUE_UP", "QUEUE_DOWN"):
+            return False
+
+        async with self.lock:
+            # Lepas target dari posisinya sekarang (kecuali reorder queue).
+            was_pilot = self.pilot is target_user
+            if action in ("QUEUE_UP", "QUEUE_DOWN"):
+                if target_user not in self.queue:
+                    return False
+                i = self.queue.index(target_user)
+                j = i - 1 if action == "QUEUE_UP" else i + 1
+                if 0 <= j < len(self.queue):
+                    self.queue[i], self.queue[j] = self.queue[j], self.queue[i]
+                await self.broadcast_state()
+                return True
+
+            if was_pilot:
+                self.pilot = None
+            elif target_user in self.spectators:
+                self.spectators.remove(target_user)
+            elif target_user in self.queue:
+                self.queue.remove(target_user)
+
+            self._reset_timers(target_user)
+
+            if action == "MAKE_PILOT":
+                old = self.pilot
+                self.pilot = target_user
+                await self._send_role(target_user, "PILOT")
+                if old:
+                    self._reset_timers(old)
+                    if len(self.spectators) < MAX_SPECTATORS:
+                        self.spectators.append(old)
+                        await self._send_role(old, "SPECTATOR")
+                    else:
+                        self.queue.insert(0, old)
+                        await self._send_role(old, "QUEUED")
+                await self._fill_vacancies()
+
+            elif action == "MAKE_SPECTATOR":
+                if len(self.spectators) >= MAX_SPECTATORS:
+                    bumped = self.spectators.pop()
+                    self.queue.insert(0, bumped)
+                    await self._send_role(bumped, "QUEUED")
+                self.spectators.append(target_user)
+                await self._send_role(target_user, "SPECTATOR")
+                await self._fill_vacancies(skip=target_user, fill_spectators=False)
+
+            elif action == "MAKE_QUEUE":
+                # Turunkan ke antrian (paling belakang). TIDAK auto-backfill
+                # slot spectator supaya penempatan admin dihormati.
+                self.queue.append(target_user)
+                await self._send_role(target_user, "QUEUED")
+                await self._fill_vacancies(skip=target_user, fill_spectators=False)
+
+            await self.broadcast_state()
+        return True
+
+    def get_role(self, websocket: WebSocket) -> str:
+        if self.pilot and self.pilot["ws"] == websocket: return "PILOT"
+        for s in self.spectators:
+            if s["ws"] == websocket: return "SPECTATOR"
+        for q in self.queue:
+            if q["ws"] == websocket: return "QUEUED"
+        return "DISCONNECTED"
+        
+    def update_activity(self, websocket: WebSocket, active: bool = True):
+        """Semua pesan memperbarui last_seen; hanya interaksi (active=True) yang
+        memperbarui last_active. HEARTBEAT memakai active=False."""
+        now = time.time()
+        everyone = ([self.pilot] if self.pilot else []) + self.spectators + self.queue
+        for u in everyone:
+            if u["ws"] == websocket:
+                u["last_seen"] = now
+                if active:
+                    u["last_active"] = now
+
+    async def idle_sweep(self, now: float):
+        """Satu putaran pemeriksaan: buang koneksi hantu, turunkan Pilot yang diam.
+        Spectator & antrean yang masih hidup tidak pernah dikeluarkan karena diam."""
+        async with self.lock:
+            everyone = ([self.pilot] if self.pilot else []) + self.spectators + self.queue
+            ghosts = [u["ws"] for u in everyone if now - u["last_seen"] > GHOST_TIMEOUT_S]
+
+        for ws in ghosts:
+            try:
+                await asyncio.wait_for(
+                    ws.send_text(json.dumps({"event": "ROLE_ASSIGNED", "role": "IDLE_TIMEOUT"})), 2.0)
+                await asyncio.wait_for(ws.close(code=1000), 2.0)
+            except Exception:
+                pass
+            await self.disconnect(ws)
+
+        async with self.lock:
+            p = self.pilot
+            if p and now - p["last_active"] > PILOT_IDLE_S and (self.spectators or self.queue):
+                self.pilot = None
+                await self._fill_vacancies()
+                self._reset_timers(p)
+                if len(self.spectators) < MAX_SPECTATORS:
+                    self.spectators.append(p)
+                    await self._send_role(p, "SPECTATOR", reason="IDLE")
+                else:
+                    self.queue.append(p)
+                    await self._send_role(p, "QUEUED", reason="IDLE")
+                await self.broadcast_state()
+
+    async def idle_timeout_check(self):
+        while True:
+            await asyncio.sleep(10)
+            try:
+                await self.idle_sweep(time.time())
+            except Exception as e:
+                print(f"[ROOM] idle_sweep gagal: {e}")
+
+room_manager = RoomManager()
+
+@router.on_event("startup")
+async def startup_event():
+    asyncio.create_task(room_manager.idle_timeout_check())
+
+# ====================================================================
+# GUARD PERINTAH DARI BROWSER (jalur WebSocket menuju Jetson)
+# ====================================================================
+WS_ALLOWED_ACTIONS = {
+    "MOVE_MOTOR", "HOMING", "UNLOCK", "SET_POSITION", "START_STREAM", "STOP_STREAM",
+    "SET_FPS", "START_RECORDING", "STOP_RECORDING", "CAPTURE_IMAGE",
+}
+WS_ACTUATOR_ACTIONS = {"MOVE_MOTOR", "HOMING", "UNLOCK", "SET_POSITION"}
+# Persamaan (6). REST 2 perintah/detik; WS 4 perintah/detik supaya klik D-Pad beruntun tetap
+# terasa lancar. Dikunci per username dan per kanal.
+REST_MOTOR_INTERVAL_S = 0.5
+WS_MOTOR_INTERVAL_S = 0.25
+
+# Dicocokkan penuh (fullmatch) supaya tidak bisa disisipi baris kedua seperti
+# "G1 X1\n$RST=*". Gabungan "G91 G1 ..." sengaja ditolak: Jetson melacak mode
+# G90/G91 hanya dari perintah tunggal, sehingga gabungan membuat GRBL diam-diam
+# tetap di mode relatif. Jog relatif cukup "G1 X0.05 F250" (lihat jog_from_gcode).
+_GCODE_RE = re.compile(r"G[01](?:[ \t]+[XYZF][+-]?\d+(?:\.\d+)?)+|G9[01]|\$[HX]", re.IGNORECASE)
+_GCODE_MOTION_RE = re.compile(r"G[01]\b|\$H", re.IGNORECASE)
+
+
+def _is_motion_command(action: str, data: dict) -> bool:
+    """Perintah yang benar-benar menggerakkan motor. G90/G91/$X/SET_POSITION tidak."""
+    if action == "HOMING":
+        return True
+    return action == "MOVE_MOTOR" and bool(_GCODE_MOTION_RE.match(str(data.get("gcode", ""))))
+
+
+def check_motor_rate_limit(username: str, now: float, channel: str = "ws") -> bool:
+    """True kalau perintah gerak boleh jalan, sekaligus mencatat waktunya. Persamaan (6)."""
+    interval = WS_MOTOR_INTERVAL_S if channel == "ws" else REST_MOTOR_INTERVAL_S
+    key = (channel, username)
+    if now - last_command_time.get(key, 0) < interval:
+        return False
+    last_command_time[key] = now
+    return True
+
+
+def cnc_offline() -> bool:
+    """Jetson tersambung, tetapi melaporkan GRBL tidak bisa dibuka."""
+    return motor_driver.jetson_websocket is not None and last_edge_telemetry.get("status") == "Offline"
+
+
+def ensure_cnc_online() -> None:
+    if cnc_offline():
+        raise HTTPException(status_code=409, detail="CNC tidak tersambung ke Jetson.")
+
+
+def validate_client_command(data: dict, ws_role: str, token_role: str, username: str, now: float):
+    """Kembalikan alasan penolakan, atau None kalau perintah boleh diteruskan ke Jetson."""
+    action = data.get("action")
+    if action not in WS_ALLOWED_ACTIONS:
+        return "NOT_ALLOWED"
+
+    if action == "SET_FPS":
+        fps = data.get("fps")
+        if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not 1 <= fps <= 120:
+            return "INVALID_PARAM"
+
+    is_admin = str(token_role).upper() == "ADMIN"
+
+    if action not in WS_ACTUATOR_ACTIONS:
+        # Kamera dipakai bersama: hanya Pilot yang boleh mengubahnya. START_STREAM tetap untuk
+        # Spectator karena dikirim otomatis saat reconnect dan tidak mengganggu penonton lain.
+        if is_admin or ws_role == "PILOT" or (action == "START_STREAM" and ws_role == "SPECTATOR"):
+            return None
+        return "NOT_PILOT"
+
+    # Sama dengan REST: menulis ulang koordinat kerja hanya untuk Admin.
+    if action == "SET_POSITION" and not is_admin:
+        return "NOT_ALLOWED"
+    if ws_role != "PILOT" and not is_admin:
+        return "NOT_PILOT"
+    if not hardware_bus_enabled:
+        return "BUS_DISABLED"
+    if action == "MOVE_MOTOR" and not _GCODE_RE.fullmatch(str(data.get("gcode", ""))):
+        return "INVALID_GCODE"
+    if _is_motion_command(action, data) and not check_motor_rate_limit(username, now):
+        return "RATE_LIMIT"
+    if action != "SET_POSITION" and cnc_offline():
+        return "CNC_OFFLINE"
+    return None
+
+
+# ====================================================================
+# 3. WEBSOCKET KHUSUS CLIENT CLIENT (BROWSER REACT)
+# ====================================================================
+@router.websocket("/client/ws")
+async def client_websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
+    """Endpoint tempat browser user (React) terhubung untuk memantau & mengontrol instrumen."""
+    # Terima handshake DULU, baru validasi token. Kalau ditolak sebelum accept(),
+    # browser hanya melihat kegagalan generik (close code 1006) dan tak bisa
+    # membedakan "token kadaluarsa" dari "jaringan putus". Dengan accept lebih
+    # dulu, kita bisa menutup memakai kode khusus 4001 yang dibaca frontend.
+    await websocket.accept()
+
+    if not token:
+        await websocket.close(code=4001)
+        return
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub", "Unknown")
+        role = payload.get("role", "user")
+    except JWTError:
+        print("[VPS CLIENT] Koneksi ditolak: token JWT kadaluarsa / tidak valid.")
+        await websocket.close(code=4001)
+        return
+
+    redis = await get_redis_client(REDIS_URL)
+    user_data = await room_manager.connect(websocket, username, role)
+    if user_data is None:
+        return
+    print(f"[VPS CLIENT] Browser user {username} ({role}) terhubung ke sirkuit interaktif.")
+
+    if motor_driver.jetson_websocket is None:
+        try:
+            await websocket.send_text(json.dumps({
+                "event": "TELEMETRY_DATA",
+                "status": "OFFLINE",
+                "limit_switch": "N/A",
+                "jetson_temp_c": None
+            }))
+        except Exception:
+            pass
+    
+    # 🟢 TASK A: Mendengarkan siaran video/telemetri dari Redis dan menembakkannya ke Browser.
+    # Pembaca Redis dan pengirim ke browser dipisah lewat ClientOutbox: pembaca
+    # tidak pernah menunggu browser, dan untuk video hanya frame terbaru yang
+    # dikirim sehingga browser lambat tidak menumpuk antrean frame basi.
+    outbox = ClientOutbox(websocket.send_text)
+
+    async def listen_to_redis_broadcast():
+        pubsub = redis.pubsub()
+        await pubsub.subscribe("microscope_video_stream", "microscope_telemetry", "microscope_scan_progress")
+        try:
+            async for message in pubsub.listen():
+                if message.get('type') == 'message':
+                    msg_text = message['data'].decode('utf-8')
+                    is_video = "STREAM_DATA" in msg_text
+                    seat = room_manager.get_role(websocket)
+
+                    # Hanya broadcast STREAM_DATA ke Pilot & Spectator (Hemat Bandwidth)
+                    if is_video and seat == "QUEUED":
+                        continue
+
+                    outbox.put(msg_text, is_video)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await pubsub.unsubscribe("microscope_video_stream", "microscope_telemetry", "microscope_scan_progress")
+            await pubsub.close()
+
+    # Jalankan pendengar siaran Redis dan pengirim ke browser di background task
+    broadcast_task = asyncio.create_task(listen_to_redis_broadcast())
+    sender_task = asyncio.create_task(outbox.run())
+
+    try:
+        # 🟢 TASK B: Jalankan antrean penerima instruksi dari Browser React
+        while True:
+            client_msg = await websocket.receive_text()
+            presence.touch(username)
+            try:
+                data = json.loads(client_msg)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            action = data.get("action")
+            if action == "HEARTBEAT":
+                # Tanda koneksi hidup saja, bukan interaksi; tidak diteruskan ke Jetson.
+                room_manager.update_activity(websocket, active=False)
+                continue
+            room_manager.update_activity(websocket, active=True)
+            if action == "PING":
+                continue
+            if action == "TAKEOVER":
+                await room_manager.takeover(websocket)
+                continue
+
+            reason = validate_client_command(
+                data, room_manager.get_role(websocket), role, username, time.time())
+            if reason:
+                await websocket.send_text(json.dumps({
+                    "event": "COMMAND_REJECTED", "reason": reason, "action": action,
+                    "cmd_id": data.get("cmd_id")}))
+                continue
+
+            # Lempar perintah dari browser langsung ke channel instruksi mekatronika
+            await redis.publish("hardware_commands", client_msg)
+
+    except WebSocketDisconnect:
+        print(f"[VPS CLIENT] Hubungan Browser user {username} terputus dari sirkuit.")
+    finally:
+        # PENTING: Bersihkan alokasi kursi untuk menghindari sesi hantu
+        await room_manager.disconnect(websocket)
+        print(f"[VPS CLIENT] Sesi user {username} telah dilepas sepenuhnya.")
+        
+        # Stop background broadcast & sender task
+        for task in (broadcast_task, sender_task):
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await redis.close()

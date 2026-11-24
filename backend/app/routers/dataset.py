@@ -1,0 +1,507 @@
+import uuid
+import os
+import json
+import shutil
+import zipfile
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Request, Query
+from fastapi.responses import FileResponse, StreamingResponse, Response
+from starlette.background import BackgroundTask
+from datetime import datetime
+from sqlalchemy.orm import Session
+from ..schemas import FolderCreate, FolderUpdate, FolderResponse, ImageCountIncrement, DeleteImagesPayload
+from typing import List, Optional
+from ..database import get_db
+from .. import models
+from ..services.deps import get_current_user, get_media_user, get_user_or_edge, require_admin
+from ..services.safe_path import safe_join, safe_name
+
+
+DATASET_DIR = "./static/datasets"
+os.makedirs(DATASET_DIR, exist_ok=True)
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+
+async def _notify_edge(payload: dict) -> None:
+    """Beri tahu Jetson (via Redis 'hardware_commands') untuk menyingkronkan
+    penghapusan — hapus salinan lokal di local_datasets/ tanpa menunggu
+    retensi orphan 7 hari milik vps_syncer.py."""
+    try:
+        from ..redis_mock import get_redis_client
+        redis_client = await get_redis_client(REDIS_URL)
+        await redis_client.publish("hardware_commands", json.dumps(payload))
+    except Exception as e:
+        print(f"[DATASET] Gagal kirim notifikasi ke Edge: {e}")
+
+def _ensure_no_active_job() -> None:
+    """Tile yang sedang dipakai scan atau stitching tidak boleh ikut terhapus."""
+    from . import hardware
+    if hardware._scan_state["running"] or hardware._stitch_state["running"]:
+        raise HTTPException(status_code=409, detail="Grid scan atau stitching sedang berjalan. Tunggu sampai selesai.")
+
+
+router = APIRouter(
+    prefix="/api/dataset",
+    tags=["Dataset Management"]
+)
+
+# --- ENDPOINT 1: BUAT FOLDER DATASET BARU ---
+@router.post("/folders", response_model=FolderResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(get_current_user)])
+def create_folder(folder_data: FolderCreate, db: Session = Depends(get_db)):
+    # Cek unik: nama folder tidak boleh kembar di database server
+    existing_folder = db.query(models.DatasetFolder).filter(models.DatasetFolder.name == folder_data.name).first()
+    if existing_folder:
+        raise HTTPException(status_code=400, detail="Nama folder dataset sudah digunakan!")
+
+    # Generate UUID unik sebagai ID string folder
+    new_id = str(uuid.uuid4())[:8] # Ambil 8 karakter depan agar ringkas di URL
+
+    new_folder = models.DatasetFolder(
+        id=new_id,
+        name=folder_data.name,
+        object_type=folder_data.object_type,
+        date=folder_data.date,
+        operator=folder_data.operator,
+        image_count=0 # Inisialisasi awal, citra masih kosong
+    )
+    
+    # Buat direktori fisik
+    os.makedirs(os.path.join(DATASET_DIR, new_id), exist_ok=True)
+
+    db.add(new_folder)
+    db.commit()
+    db.refresh(new_folder)
+    return new_folder
+
+# --- ENDPOINT 2: AMBIL SEMUA DAFTAR FOLDER DATASET ---
+@router.get("/folders", response_model=List[FolderResponse], dependencies=[Depends(get_current_user)])
+def get_all_folders(db: Session = Depends(get_db)):
+    folders = db.query(models.DatasetFolder).all()
+    
+    # Auto-sync physical file count with database to prevent mismatch
+    dirty = False
+    for folder in folders:
+        folder_path = os.path.join(DATASET_DIR, folder.id)
+        if os.path.exists(folder_path):
+            files = os.listdir(folder_path)
+            img_count = sum(1 for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg')) and not f.startswith('_temp_') and os.path.getsize(os.path.join(DATASET_DIR, folder.id, f)) > 0)
+            vid_count = sum(1 for f in files if f.lower().endswith(('.mp4', '.webm', '.avi')) and not f.startswith('_temp_') and os.path.getsize(os.path.join(DATASET_DIR, folder.id, f)) > 0)
+            if folder.image_count != img_count:
+                folder.image_count = img_count
+                dirty = True
+            setattr(folder, "video_count", vid_count)
+        else:
+            setattr(folder, "video_count", 0)
+    if dirty:
+        db.commit()
+        
+    return folders
+
+# --- ENDPOINT 2.2: STREAMING VIDEO WITH PROPER HTTP RANGE SUPPORT ---
+@router.get("/video/{folder_id}/{filename}", dependencies=[Depends(get_media_user)])
+def stream_video(folder_id: str, filename: str, request: Request):
+    """Serve video with HTTP 206 Range support for browser video players."""
+    file_path = safe_join(DATASET_DIR, folder_id, filename)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Video tidak ditemukan")
+
+    file_size = os.path.getsize(file_path)
+    if file_size == 0:
+        raise HTTPException(status_code=404, detail="File video kosong atau belum selesai direkam")
+
+    # Determine correct media type
+    ext = filename.lower().rsplit('.', 1)[-1]
+    media_type_map = {'mp4': 'video/mp4', 'webm': 'video/webm', 'avi': 'video/x-msvideo'}
+    media_type = media_type_map.get(ext, 'video/mp4')
+
+    range_header = request.headers.get("Range")
+
+    def iterfile(start: int, end: int):
+        chunk_size = 1024 * 256  # 256 KB
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = f.read(min(chunk_size, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    if range_header:
+        try:
+            range_val = range_header.replace("bytes=", "")
+            start_str, end_str = range_val.split("-")
+            start = int(start_str)
+            end = int(end_str) if end_str else file_size - 1
+        except Exception:
+            start = 0
+            end = file_size - 1
+
+        end = min(end, file_size - 1)
+        content_length = end - start + 1
+
+        return StreamingResponse(
+            iterfile(start, end),
+            status_code=206,
+            media_type=media_type,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(content_length),
+            },
+        )
+    else:
+        return StreamingResponse(
+            iterfile(0, file_size - 1),
+            status_code=200,
+            media_type=media_type,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(file_size),
+            },
+        )
+
+
+@router.get("/storage-info", dependencies=[Depends(get_current_user)])
+def get_storage_info():
+    try:
+        total, used, free = shutil.disk_usage(DATASET_DIR)
+        used_percentage = round((used / total) * 100) if total > 0 else 0
+        total_gb = round(total / (1024**3), 2)
+        used_gb = round(used / (1024**3), 2)
+        return {
+            "total_gb": total_gb,
+            "used_gb": used_gb,
+            "used_percentage": used_percentage
+        }
+    except OSError as e:
+        raise HTTPException(status_code=503, detail=f"Info penyimpanan tidak tersedia: {e}")
+
+# --- ENDPOINT 2.5: PERBARUI METADATA FOLDER ---
+@router.put("/folders/{folder_id}", response_model=FolderResponse, dependencies=[Depends(get_current_user)])
+def update_folder(folder_id: str, payload: FolderUpdate, db: Session = Depends(get_db)):
+    folder = db.query(models.DatasetFolder).filter(models.DatasetFolder.id == folder_id).first()
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder dataset tidak ditemukan!")
+    
+    folder.name = payload.name
+    folder.object_type = payload.object_type
+    folder.operator = payload.operator
+    db.commit()
+    db.refresh(folder)
+    return folder
+
+# --- ENDPOINT 3: HAPUS FOLDER DATASET PERMANEN ---
+@router.delete("/folders/{folder_id}", dependencies=[Depends(get_current_user)])
+async def delete_dataset_folder(folder_id: str, db: Session = Depends(get_db)):
+    folder = db.query(models.DatasetFolder).filter(models.DatasetFolder.id == folder_id).first()
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder dataset tidak ditemukan!")
+
+    # Hapus direktori fisik
+    shutil.rmtree(safe_join(DATASET_DIR, folder_id), ignore_errors=True)
+
+    db.delete(folder)
+    db.commit()
+    # Beri tahu Jetson agar hapus local_datasets/<folder_id> juga.
+    await _notify_edge({"action": "PURGE_DATASET_FOLDER", "folder_id": folder_id})
+    return {"message": "Folder dataset beserta metadata di dalamnya berhasil dihapus"}
+
+# --- ENDPOINT 4: TAMBAH JUMLAH GAMBAR SECARA DINAMIS PASCA GRID SCAN ---
+@router.put("/folders/{folder_id}/add-images", dependencies=[Depends(get_current_user)])
+def increment_image_count(folder_id: str, payload: ImageCountIncrement, db: Session = Depends(get_db)):
+    folder = db.query(models.DatasetFolder).filter(models.DatasetFolder.id == folder_id).first()
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder dataset tidak ditemukan!")
+
+    # Validasi semua nama dulu, supaya request yang ditolak tidak mengubah apa pun.
+    filenames = [safe_name(f) for f in payload.filenames]
+
+    folder.image_count += payload.count
+    db.commit()
+    db.refresh(folder)
+
+    # Move files from static/uploads to static/datasets/{folder_id}
+    folder_path = safe_join(DATASET_DIR, folder_id)
+    os.makedirs(folder_path, exist_ok=True)
+    uploads_dir = os.path.join(DATASET_DIR, "..", "uploads")
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    for filename in filenames:
+        src = os.path.join(uploads_dir, filename)
+        
+        base_name, ext = os.path.splitext(filename)
+        new_filename = f"{base_name}_{timestamp}{ext}"
+        
+        dst = os.path.join(folder_path, new_filename)
+        if os.path.exists(src):
+            try:
+                shutil.copy2(src, dst)
+            except Exception as e:
+                print(f"[ERROR] Gagal menyalin file {filename}: {e}")
+    return {"message": "Jumlah gambar berhasil dimutasi", "current_image_count": folder.image_count}
+
+
+@router.get("/folders/{folder_id}/images", dependencies=[Depends(get_current_user)])
+def get_folder_images(folder_id: str):
+    folder_path = safe_join(DATASET_DIR, folder_id)
+    if not os.path.exists(folder_path):
+        return []
+    
+    images = []
+    files = os.listdir(folder_path)
+    for f in files:
+        if f.lower().endswith(('.png', '.jpg', '.jpeg', '.mp4', '.webm')):
+            # Skip temp files and 0-byte files
+            if f.startswith('_temp_'):
+                continue
+            full_path = os.path.join(folder_path, f)
+            if os.path.getsize(full_path) == 0:
+                continue
+            is_synced = f"{f}.synced" in files
+            images.append({"name": f, "synced": is_synced})
+            
+    images.sort(key=lambda x: x["name"])
+    return images
+
+@router.post("/folders/{folder_id}/files", dependencies=[Depends(get_user_or_edge)])
+def upload_files(folder_id: str, files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
+    folder = db.query(models.DatasetFolder).filter(models.DatasetFolder.id == folder_id).first()
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder dataset tidak ditemukan!")
+    
+    folder_path = safe_join(DATASET_DIR, folder_id)
+    # Validasi semua nama dulu, supaya batch yang ditolak tidak tertulis sebagian.
+    for file in files:
+        if file.filename:
+            safe_name(file.filename)
+    os.makedirs(folder_path, exist_ok=True)
+    
+    saved_count = 0
+    for file in files:
+        if file.filename:
+            file_location = safe_join(folder_path, file.filename)
+            with open(file_location, "wb") as f:
+                shutil.copyfileobj(file.file, f)
+            saved_count += 1
+            # Endpoint ini adalah pintu masuk upstream-sync dari Jetson
+            # (vps_syncer.py) maupun unggah manual browser. Tandai .synced agar
+            # UI bisa membedakan file yang sudah melewati pipa sinkron Edge<->VPS
+            # dengan file hasil grid-scan (masuk lewat /add-images) yang masih
+            # menunggu di-mirror TURUN ke Jetson.
+            try:
+                with open(file_location + ".synced", "w") as marker:
+                    marker.write("SYNCED_OK")
+            except Exception:
+                pass
+
+    folder.image_count += saved_count
+    db.commit()
+    db.refresh(folder)
+    return {"message": f"{saved_count} file berhasil diunggah", "current_image_count": folder.image_count}
+
+@router.get("/folders/{folder_id}/files/{filename}/download", dependencies=[Depends(get_user_or_edge)])
+def download_single_file(folder_id: str, filename: str):
+    file_path = safe_join(DATASET_DIR, folder_id, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Gambar tidak ditemukan")
+    return FileResponse(path=file_path, filename=filename)
+
+@router.delete("/folders/{folder_id}/images", dependencies=[Depends(get_current_user)])
+async def delete_images(folder_id: str, payload: DeleteImagesPayload, db: Session = Depends(get_db)):
+    folder = db.query(models.DatasetFolder).filter(models.DatasetFolder.id == folder_id).first()
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder dataset tidak ditemukan!")
+
+    folder_path = safe_join(DATASET_DIR, folder_id)
+    deleted_count = 0
+    # Validasi semua nama dulu, supaya request yang ditolak tidak menghapus sebagian.
+    filenames = [safe_name(f) for f in payload.filenames]
+
+    for filename in filenames:
+        file_path = safe_join(folder_path, filename)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            deleted_count += 1
+            # Hapus juga file .synced jika ada
+            synced_marker = file_path + ".synced"
+            if os.path.exists(synced_marker):
+                os.remove(synced_marker)
+
+    # Pastikan count tidak kurang dari 0
+    folder.image_count = max(0, folder.image_count - deleted_count)
+    db.commit()
+    db.refresh(folder)
+    # Beri tahu Jetson agar hapus salinan lokalnya juga (tak perlu tunggu retensi 7 hari).
+    await _notify_edge({"action": "PURGE_DATASET_FILES", "folder_id": folder_id, "filenames": payload.filenames})
+    return {"message": f"{deleted_count} gambar berhasil dihapus", "current_image_count": folder.image_count}
+
+@router.get("/folders/{folder_id}/download", dependencies=[Depends(get_media_user)])
+def download_folder_zip(
+    folder_id: str,
+    db: Session = Depends(get_db),
+    files: Optional[List[str]] = Query(None, description="Batasi ke file tertentu (bisa berulang)"),
+    export_format: Optional[str] = Query(None, alias="format", description="'yolo' -> struktur images/ + labels/ + data.yaml"),
+):
+    folder = db.query(models.DatasetFolder).filter(models.DatasetFolder.id == folder_id).first()
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder dataset tidak ditemukan!")
+
+    folder_path = safe_join(DATASET_DIR, folder_id)
+    if not os.path.exists(folder_path) or not os.listdir(folder_path):
+        raise HTTPException(status_code=400, detail="Folder dataset kosong, tidak ada yang bisa diunduh.")
+
+    # Kumpulan file yang akan di-zip
+    all_files = [f for f in os.listdir(folder_path)
+                 if not f.endswith('.synced') and os.path.isfile(os.path.join(folder_path, f))]
+    if files:
+        wanted = set(files)
+        pick = [f for f in all_files if f in wanted]
+        if not pick:
+            raise HTTPException(status_code=404, detail="File yang diminta tidak ada di folder.")
+    else:
+        pick = all_files
+
+    is_yolo = (export_format or "").lower() == "yolo"
+    suffix = "_YOLO" if is_yolo else ("_pilihan" if files else "")
+    zip_filename = f"{folder.name}{suffix}.zip"
+    # folder.name bebas diisi pengguna, jadi tidak dipakai untuk path di disk.
+    zip_filepath = safe_join(DATASET_DIR, f"{folder_id}_{uuid.uuid4().hex[:6]}.zip")
+
+    img_exts = ('.png', '.jpg', '.jpeg', '.bmp')
+    with zipfile.ZipFile(zip_filepath, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        if is_yolo:
+            cls = (folder.object_type or "object").strip()
+            imgs = [f for f in pick if f.lower().endswith(img_exts)]
+            for f in imgs:
+                zipf.write(os.path.join(folder_path, f), f"images/{f}")
+                # Label kosong (sistem ini belum menyimpan anotasi bounding box).
+                zipf.writestr(f"labels/{os.path.splitext(f)[0]}.txt", "")
+            zipf.writestr("classes.txt", cls + "\n")
+            zipf.writestr("data.yaml",
+                          f"path: .\ntrain: images\nval: images\nnc: 1\nnames: ['{cls}']\n")
+            zipf.writestr("README.txt",
+                          "Struktur YOLO. File labels/*.txt sengaja KOSONG karena sistem "
+                          "akuisisi ini belum menyimpan anotasi bounding box — isi manual "
+                          "(mis. pakai LabelImg) sebelum training.\n")
+        else:
+            for f in pick:
+                zipf.write(os.path.join(folder_path, f), f)
+
+    # File zip hanya sementara. Tanpa ini, setiap unduhan menumpuk di disk VPS.
+    return FileResponse(path=zip_filepath, filename=zip_filename, media_type='application/zip',
+                        background=BackgroundTask(os.remove, zip_filepath))
+
+# --- ENDPOINT INDEX SINKRONISASI DUA ARAH (DOWNSTREAM MIRRORING) ---
+@router.get("/vps/sync-index", dependencies=[Depends(get_user_or_edge)])
+def get_vps_sync_index(db: Session = Depends(get_db)):
+    folders = db.query(models.DatasetFolder).all()
+    index = {}
+    for folder in folders:
+        folder_path = os.path.join(DATASET_DIR, folder.id)
+        files = []
+        if os.path.exists(folder_path):
+            files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.mp4', '.webm'))]
+        index[folder.id] = {
+            "name": folder.name,
+            "object_type": folder.object_type,
+            "operator": folder.operator,
+            "date": folder.date,
+            "files": files
+        }
+    return {"folders": index}
+
+# --- ENDPOINT 13: EXPORT ALL STORAGE ---
+@router.get("/storage/export", dependencies=[Depends(require_admin)])
+def export_all_dataset():
+    zip_filename = "all_datasets_export.zip"
+    zip_path = os.path.join(DATASET_DIR, zip_filename)
+    
+    # Create zip containing all folders
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(DATASET_DIR):
+            for file in files:
+                if file != zip_filename:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, DATASET_DIR)
+                    zipf.write(file_path, arcname)
+                    
+    return FileResponse(path=zip_path, filename=zip_filename, media_type="application/zip",
+                        background=BackgroundTask(os.remove, zip_path))
+
+# --- ENDPOINT 14: PURGE TEMPORARY CACHE ---
+import json
+import redis.asyncio as redis
+
+@router.delete("/storage/purge-cache", dependencies=[Depends(require_admin)])
+async def purge_temporary_cache():
+    """Hanya berkas sementara: uploads, berkas _temp_, dan zip sisa unduhan. Dataset dan
+    database tidak tersentuh. Di Jetson, seluruh tmp_images ikut dibersihkan."""
+    _ensure_no_active_job()
+    cleared_bytes = 0
+    
+    # 1. Bersihkan file _temp_ dan zip sisa unduhan di DATASET_DIR. Dataset ada di subfolder.
+    for root, dirs, files in os.walk(DATASET_DIR):
+        for file in files:
+            if file.startswith("_temp_") or (file.endswith(".zip") and os.path.samefile(root, DATASET_DIR)):
+                file_path = os.path.join(root, file)
+                cleared_bytes += os.path.getsize(file_path)
+                os.remove(file_path)
+                
+    # 2. Bersihkan seluruh file gambar di UPLOAD_DIR
+    UPLOAD_DIR = "./static/uploads"
+    if os.path.exists(UPLOAD_DIR):
+        for file in os.listdir(UPLOAD_DIR):
+            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.json')):
+                file_path = os.path.join(UPLOAD_DIR, file)
+                cleared_bytes += os.path.getsize(file_path)
+                os.remove(file_path)
+                
+    # 3. Kirim perintah PURGE_CACHE ke Edge Device via Redis
+    try:
+        from ..redis_mock import get_redis_client
+        redis_client = await get_redis_client(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+        await redis_client.publish("hardware_commands", json.dumps({"action": "PURGE_CACHE"}))
+        # Do not close the shared redis client if it's mock
+    except Exception as e:
+        print("Failed to publish PURGE_CACHE:", e)
+        
+    return {"message": f"Cache purged. {cleared_bytes} bytes freed."}
+
+@router.delete("/storage/purge-all", dependencies=[Depends(require_admin)])
+async def purge_all_datasets(db: Session = Depends(get_db)):
+    """Seluruh dataset di VPS dan Jetson, beserta daftar foldernya. Akun, log, dan
+    pengaturan tidak tersentuh."""
+    _ensure_no_active_job()
+    cleared_bytes = 0
+    
+    # 1. Hitung ukuran sebelum dihapus
+    if os.path.exists(DATASET_DIR):
+        for root, dirs, files in os.walk(DATASET_DIR):
+            for file in files:
+                cleared_bytes += os.path.getsize(os.path.join(root, file))
+        
+        # Hapus seluruh folder dataset dan buat ulang
+        shutil.rmtree(DATASET_DIR, ignore_errors=True)
+        os.makedirs(DATASET_DIR, exist_ok=True)
+        
+    # 2. Hapus seluruh data di SQLite database
+    try:
+        db.query(models.DatasetFolder).delete()
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print("Failed to delete database records:", e)
+
+    # 3. Kirim perintah PURGE_ALL_DATASETS ke Edge Device via Redis
+    try:
+        from ..redis_mock import get_redis_client
+        redis_client = await get_redis_client(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+        await redis_client.publish("hardware_commands", json.dumps({"action": "PURGE_ALL_DATASETS"}))
+    except Exception as e:
+        print("Failed to publish PURGE_ALL_DATASETS:", e)
+        
+    return {"message": f"All datasets purged successfully. {cleared_bytes} bytes freed."}

@@ -1,0 +1,91 @@
+name: CI/CD Deployment to BRIN VPS
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch: {}      # tombol "Run workflow" di UI -> deploy TIP main terbaru
+
+# Hanya SATU deploy aktif/antre. Run baru membatalkan run lama yang belum selesai.
+concurrency:
+  group: vps-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build & Deploy via Self-Hosted Runner
+    # Label khusus: repo punya lebih dari satu self-hosted runner, dan deploy hanya boleh di VPS.
+    runs-on: [self-hosted, vps]
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: false       # backend/static/{datasets,uploads} di-bind-mount ke kontainer
+
+      - name: 🔁 SELALU deploy TIP branch (bukan commit pemicu run)
+        run: |
+          # Kunci anti-"run lama menimpa deploy baru": apa pun commit yang
+          # memicu run ini, yang di-deploy SELALU tip origin/<branch> saat ini.
+          BR="${GITHUB_REF_NAME:-main}"
+          git fetch origin "$BR"
+          git reset --hard FETCH_HEAD
+          echo "Deploy tip $BR:"; git log --oneline -1
+
+      - name: 🔐 .env production
+        run: cp ~/.env-production .env
+
+      - name: 🐳 Build backend
+        run: docker compose build --no-cache backend
+
+      - name: 🐳 Build frontend
+        run: docker compose build frontend      # pakai layer cache -> hemat RAM di VPS 2GB
+
+      - name: 🚀 Recreate backend + frontend saja (hindari OOM seluruh stack)
+        run: |
+          docker compose up -d --force-recreate --no-deps backend frontend nginx
+          docker compose ps
+
+      - name: ✅ Verifikasi kontainer = kode yang baru di-deploy
+        run: |
+          EXPECTED=$(sed -n 's/^BUILD_MARKER *= *"\([^"]*\)".*/\1/p' backend/app/main.py)
+          echo "marker diharapkan: $EXPECTED"
+          [ -n "$EXPECTED" ] || { echo "::error::BUILD_MARKER tak terbaca dari source"; exit 1; }
+
+          # a) kode DI DALAM kontainer harus marker ini
+          if ! docker exec mikroskop_backend sh -c "grep -qF '$EXPECTED' /app/app/main.py"; then
+            echo "::error::Kontainer mikroskop_backend TIDAK memuat $EXPECTED (recreate gagal / OOM)"
+            docker compose logs --tail=40 backend || true
+            exit 1
+          fi
+
+          # b) endpoint harus melaporkan marker ini
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            curl -sf http://127.0.0.1:8000/api/version -o /tmp/v.json && break
+            echo "menunggu backend siap ($i/10)"; sleep 3
+          done
+          cat /tmp/v.json; echo
+          grep -qF "$EXPECTED" /tmp/v.json || { echo "::error::/api/version bukan $EXPECTED"; exit 1; }
+
+          # c) nginx (pintu masuk dari Cloudflare) harus hidup dan meneruskan ke backend
+          for i in 1 2 3 4 5; do
+            curl -sf http://127.0.0.1/api/version -o /tmp/n.json && break
+            echo "menunggu nginx ($i/5)"; sleep 3
+          done
+          grep -qF "$EXPECTED" /tmp/n.json || { echo "::error::nginx tidak meneruskan /api/version"; docker compose logs --tail=20 nginx || true; exit 1; }
+          curl -sI http://127.0.0.1/ | grep -i '^x-frame-options' || { echo "::error::header keamanan nginx tidak terpasang"; exit 1; }
+          # d) frontend menyajikan halaman dan tidak membocorkan versi nginx
+          curl -sf http://127.0.0.1/ -o /tmp/index.html && grep -qi '<div id="root"' /tmp/index.html || { echo "::error::frontend tidak menyajikan index.html"; docker compose logs --tail=20 frontend || true; exit 1; }
+          if curl -s http://127.0.0.1/tidak-ada-$$ | grep -qi 'nginx/[0-9]'; then echo "::error::halaman 404 masih menampilkan versi nginx"; exit 1; fi
+          echo "✅ Live: $EXPECTED"
+
+      # Tetap jalan walau verifikasi gagal. Hanya cache yang dipakai deploy ini yang disimpan:
+      # build --no-cache menumpuk sampai 20 GB dan batas 3 hari terbukti tidak cukup.
+      - name: 🧹 Prune image dan cache build lama
+        if: always()
+        run: |
+          docker image prune -f
+          docker builder prune -af --filter until=1h
+          df -h /

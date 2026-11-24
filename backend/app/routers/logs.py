@@ -1,0 +1,40 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import desc
+from typing import List
+from ..schemas import LogCreate, LogResponse
+from datetime import datetime
+from ..database import get_db
+from .. import models
+from ..services.deps import get_current_user, require_admin
+
+router = APIRouter(prefix="/api/logs", tags=["logs"])
+
+
+@router.get("", response_model=List[LogResponse], dependencies=[Depends(get_current_user)])
+def get_logs(limit: int = 100, db: Session = Depends(get_db)):
+    """Mengambil riwayat log terbaru (maks 100)."""
+    logs = db.query(models.SystemLog).order_by(desc(models.SystemLog.timestamp), desc(models.SystemLog.id)).limit(limit).all()
+    return logs
+
+@router.post("", response_model=LogResponse, dependencies=[Depends(get_current_user)])
+def create_log(payload: LogCreate, db: Session = Depends(get_db)):
+    """Menyimpan log baru ke dalam sistem."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    db_log = models.SystemLog(
+        timestamp=now_str,
+        operator=payload.operator,
+        action=payload.action,
+        status=payload.status
+    )
+    db.add(db_log)
+    db.commit()
+    db.refresh(db_log)
+    return db_log
+
+@router.delete("", status_code=200, dependencies=[Depends(require_admin)])
+def clear_logs(db: Session = Depends(get_db)):
+    """Menghapus seluruh riwayat log dari sistem (hanya Admin)."""
+    deleted_count = db.query(models.SystemLog).delete()
+    db.commit()
+    return {"message": f"{deleted_count} log berhasil dihapus."}
